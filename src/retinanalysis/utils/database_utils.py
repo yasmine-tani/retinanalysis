@@ -4,12 +4,23 @@ from typing import List
 
 
 def populate_database(
-    username=USER, h5_dir=H5_DIR, meta_dir=META_DIR, tags_dir=TAGS_DIR
+    username=USER,
+    h5_dir=H5_DIR,
+    meta_dir=META_DIR,
+    tags_dir=TAGS_DIR,
+    refresh_existing: bool = False,
 ):
 
     schema_module = get_schema_module()
 
-    return database_pop.append_data(h5_dir, meta_dir, tags_dir, username, schema_module)
+    return database_pop.append_data(
+        h5_dir,
+        meta_dir,
+        tags_dir,
+        username,
+        schema_module,
+        refresh_existing=refresh_existing,
+    )
 
 
 def reload_experiment_data(

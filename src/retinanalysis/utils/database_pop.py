@@ -4,6 +4,7 @@ import datajoint as dj
 import json
 import os
 import datetime
+from pathlib import Path
 from tqdm.auto import tqdm
 
 from retinanalysis._database import get_schema_module
@@ -255,69 +256,163 @@ def build_tuple(base_tuple: dict, level: str, meta: dict) -> dict:
     return base_tuple
 
 
+def _iter_sorting_algorithm_dirs(chunk_path: str):
+    if not os.path.isdir(chunk_path):
+        return []
+
+    algorithm_dirs = []
+    seen = set()
+
+    for root, _, files in os.walk(chunk_path):
+        if "cluster_KSLabel.tsv" in files:
+            real_root = os.path.realpath(root)
+            if real_root not in seen:
+                algorithm_dirs.append(real_root)
+                seen.add(real_root)
+
+    if not algorithm_dirs and os.path.exists(os.path.join(chunk_path, "cluster_KSLabel.tsv")):
+        algorithm_dirs.append(os.path.realpath(chunk_path))
+
+    return algorithm_dirs
+
+
+def discover_sorting_chunks(experiment_dir: str):
+    if not os.path.isdir(experiment_dir):
+        return []
+
+    discovered = []
+    seen = set()
+
+    for entry in sorted(os.listdir(experiment_dir)):
+        full_path = os.path.join(experiment_dir, entry)
+        if not os.path.isdir(full_path):
+            continue
+
+        if entry in {"kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "ksfiles", "combined"}:
+            continue
+
+        algorithm_dirs = _iter_sorting_algorithm_dirs(full_path)
+        has_sorting_subdir = any(
+            child in {"ksfiles", "kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined"}
+            for child in os.listdir(full_path)
+            if os.path.isdir(os.path.join(full_path, child))
+        )
+
+        if entry.startswith("data") or entry.startswith("chunk") or algorithm_dirs or has_sorting_subdir:
+            key = (entry, full_path)
+            if key not in seen:
+                discovered.append({"chunk_name": entry, "chunk_path": Path(os.path.realpath(full_path))})
+                seen.add(key)
+
+    # Also support an experiment root that contains a top-level algorithm folder such as kilosort25
+    for entry in sorted(os.listdir(experiment_dir)):
+        full_path = os.path.join(experiment_dir, entry)
+        if not os.path.isdir(full_path):
+            continue
+        if entry not in {"kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "ksfiles", "combined"}:
+            continue
+
+        for sub_entry in sorted(os.listdir(full_path)):
+            sub_path = os.path.join(full_path, sub_entry)
+            if not os.path.isdir(sub_path):
+                continue
+            if sub_entry.startswith("data") or sub_entry.startswith("chunk"):
+                key = (sub_entry, sub_path)
+                if key not in seen:
+                    discovered.append({"chunk_name": sub_entry, "chunk_path": Path(os.path.realpath(sub_path))})
+                    seen.add(key)
+
+    return discovered
+
+
 # database populator methods: from analysis
 def append_sorting_files(chunk_id: int, algorithm: str, sorting_dir: str):
     p1 = os.path.split(sorting_dir)
     p2 = os.path.split(p1[0])
     p3 = os.path.split(p2[0])
     analysis_dir = os.path.join(ANALYSIS_DIR, p3[1], p2[1], p1[1])
-    # check if real path
-    if not os.path.exists(analysis_dir):
-        return
-    for file in os.listdir(analysis_dir):
-        if file.endswith(".txt"):
-            CellTypeFile.insert1(
-                {"chunk_id": chunk_id, "algorithm": algorithm, "file_name": file}
-            )
-            file_id = max_id(CellTypeFile)
-            cell_types = []
-            try:
-                with open(os.path.join(analysis_dir, file)) as f:
-                    for line in f:
-                        # each line is cluster_id (two spaces) cell_type
-                        cluster_id, cell_type = line.split()
-                        sorted_cell_id = (
-                            SortedCell
-                            & f"chunk_id={chunk_id}"
-                            & f"algorithm='{algorithm}' "
-                            & f"cluster_id={cluster_id}"
-                        ).fetch1()["id"]
-                        cell_types.append(
-                            {
-                                "sorted_cell_id": sorted_cell_id,
-                                "file_id": file_id,
-                                "cell_type": cell_type,
-                            }
-                        )
-            except Exception as e:
-                print(f"Error reading cell typing file {file}: {e}")
-                continue
-            SortedCellType.insert(cell_types)
+    candidate_files = []
+    seen_files = set()
+
+    for base_dir in [analysis_dir, sorting_dir]:
+        if not os.path.isdir(base_dir):
+            continue
+        for root, _, files in os.walk(base_dir):
+            for file in files:
+                if not file.endswith(".txt"):
+                    continue
+                full_path = os.path.join(root, file)
+                if full_path in seen_files:
+                    continue
+                seen_files.add(full_path)
+                candidate_files.append(full_path)
+
+    for file_path in candidate_files:
+        file_name = os.path.basename(file_path)
+        CellTypeFile.insert1(
+            {"chunk_id": chunk_id, "algorithm": algorithm, "file_name": file_name}
+        )
+        file_id = max_id(CellTypeFile)
+        cell_types = []
+        try:
+            with open(file_path) as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+                    cluster_id, cell_type = parts[0], parts[1]
+                    sorted_cell_id = (
+                        SortedCell
+                        & f"chunk_id={chunk_id}"
+                        & f"algorithm='{algorithm}' "
+                        & f"cluster_id={cluster_id}"
+                    ).fetch1()["id"]
+                    cell_types.append(
+                        {
+                            "sorted_cell_id": sorted_cell_id,
+                            "file_id": file_id,
+                            "cell_type": cell_type,
+                        }
+                    )
+        except Exception as e:
+            print(f"Error reading cell typing file {file_name}: {e}")
+            continue
+        SortedCellType.insert(cell_types)
 
 
 def append_sorting_chunk(experiment_id: int, chunk_name: str, chunk_path: str):
     SortingChunk.insert1({"experiment_id": experiment_id, "chunk_name": chunk_name})
     chunk_id = max_id(SortingChunk)
-    for algorithm in os.listdir(chunk_path):
-        if "kilosort" not in algorithm:
-            print(f"Populator not implemented for {algorithm}")
-            continue
+    algorithm_dirs = _iter_sorting_algorithm_dirs(chunk_path)
 
-        algorithm_dir = os.path.join(chunk_path, algorithm)
-        if "cluster_KSLabel.tsv" not in os.listdir(algorithm_dir):
-            print(f"Could not find cluster_KSLabel.tsv in {algorithm_dir}")
+    if not algorithm_dirs:
+        print(f"No sortable algorithm directory found in {chunk_path}")
+        return
+
+    for algorithm_dir in algorithm_dirs:
+        algorithm = os.path.basename(algorithm_dir)
+        cluster_label_candidates = [
+            os.path.join(algorithm_dir, "cluster_KSLabel.tsv"),
+            os.path.join(algorithm_dir, "cluster_group.tsv"),
+            os.path.join(algorithm_dir, "cluster_ContamPct.tsv"),
+        ]
+        cluster_label_path = next(
+            (path for path in cluster_label_candidates if os.path.exists(path)),
+            None,
+        )
+        if cluster_label_path is None:
+            print(f"No cluster label file found in {algorithm_dir}; skipping SortedCell population")
             continue
 
         cluster_list = []
-        with open(os.path.join(algorithm_dir, "cluster_KSLabel.tsv")) as f:
-            # tsv where first column is "cluster_id", add each one to the database
+        with open(cluster_label_path) as f:
             for line in f:
                 if line.startswith("cluster_id"):
                     continue
-                cluster_id = int(line.split("\t")[0])
-                ### THIS NEXT LINE IS VERY IMPORTANT: CLUSTER_ID IS ZERO-INDEXED IN THIS ONE LOCATION.
-                ### BUT EVERYWHERE ELSE IT IS ONE-INDEXED BECAUSE MATLAB IS ONE-INDEXED.
-                ### SO HERE WE WILL ADD ONE TO THE CLUSTER_IDS AND USE THAT AS THE SOURCE-OF-TRUTH.
+                parts = line.split("\t")
+                if not parts:
+                    continue
+                cluster_id = int(parts[0])
                 cluster_id += 1
                 cluster_list.append(
                     {
@@ -333,37 +428,52 @@ def append_sorting_chunk(experiment_id: int, chunk_name: str, chunk_path: str):
 
 def append_experiment_analysis(experiment_id: int, exp_name: str):
     print(f"Adding analysis for experiment {experiment_id}, {exp_name}")
-    # exp_name = (Experiment & f"id={experiment_id}").fetch1()['data_file']
-    # exp_name = os.path.basename(exp_name)[:-3]
     if exp_name not in os.listdir(DATA_DIR):
         print(f"Could not find data directory for experiment {exp_name}")
         return
 
     experiment_dir = os.path.join(DATA_DIR, exp_name)
     print(f"Looking in {experiment_dir}")
-    for file in os.listdir(experiment_dir):
-        if os.path.isdir(os.path.join(experiment_dir, file)) and not file.startswith(
-            "data"
-        ):
-            append_sorting_chunk(
-                experiment_id, file, os.path.join(experiment_dir, file)
-            )
+    for candidate in discover_sorting_chunks(experiment_dir):
+        append_sorting_chunk(experiment_id, candidate["chunk_name"], candidate["chunk_path"])
 
 
 # given a data directory (ending in dataXXX) and the experiment id, find the correct chunk ID.
 def get_block_chunk(experiment_id: int, data_dir: str) -> int:
-    # data_index = data_dir.split("/")[1]
-    data_index = os.path.basename(data_dir)
+    data_index = os.path.basename(data_dir.rstrip("/\\"))
     possible_chunks = (SortingChunk & f"experiment_id={experiment_id}").to_arrays(
         "chunk_name"
     )
     exp_name = (Experiment & f"id={experiment_id}").fetch1("exp_name")
-    # exp_name = os.path.basename(exp_name)[:-3]
     experiment_dir = os.path.join(DATA_DIR, exp_name)
+
     for chunk_name in possible_chunks:
+        if chunk_name == data_index:
+            return (
+                SortingChunk
+                & f"experiment_id={experiment_id}"
+                & f"chunk_name='{chunk_name}'"
+            ).fetch1()["id"]
+
+        candidate_paths = [
+            os.path.join(experiment_dir, chunk_name),
+            os.path.join(experiment_dir, chunk_name, "kilosort2.5"),
+            os.path.join(experiment_dir, chunk_name, "kilosort4"),
+            os.path.join(experiment_dir, chunk_name, "ksfiles"),
+            os.path.join(experiment_dir, "combined", chunk_name),
+            os.path.join(experiment_dir, "combined", chunk_name, "kilosort2.5"),
+            os.path.join(experiment_dir, "combined", chunk_name, "kilosort4"),
+        ]
+        if any(os.path.isdir(path) for path in candidate_paths):
+            if os.path.basename(data_dir.rstrip("/\\")) == chunk_name:
+                return (
+                    SortingChunk
+                    & f"experiment_id={experiment_id}"
+                    & f"chunk_name='{chunk_name}'"
+                ).fetch1()["id"]
+
         f = os.path.join(experiment_dir, f"{exp_name}_{chunk_name}.txt")
         if not os.path.exists(f):
-            print(f"ERROR: could not find chunk file: {f}")
             continue
         with open(f) as file:
             if data_index in file.read():
@@ -372,6 +482,7 @@ def get_block_chunk(experiment_id: int, data_dir: str) -> int:
                     & f"experiment_id={experiment_id}"
                     & f"chunk_name='{chunk_name}'"
                 ).fetch1()["id"]
+
     print(f"ERROR: could not find a chunk for this data directory: {data_dir}")
     return None
 
@@ -497,9 +608,9 @@ def append_epoch_block(
     # })
     # Get the chunk_id from the data directory.
     if is_mea:
-        data_xxx = epoch_block["dataFile"].split("/")[1]
+        data_path = str(epoch_block.get("dataFile", ""))
+        data_xxx = os.path.basename(data_path.rstrip("/\\"))
         exp_name = (Experiment & f"id={experiment_id}").fetch1("exp_name")
-        # exp_name = os.path.basename(exp_name)[:-3]
         data_dir = os.path.join(exp_name, data_xxx)
     else:
         data_dir = ""
@@ -759,7 +870,12 @@ def gen_meta_list(data_dir: str, meta_dir: str, tags_dir: str) -> list:
 
 # entrance method to generate database from a directory
 def append_data(
-    data_dir: str, meta_dir: str, tags_dir: str, username: str, db_param: object
+    data_dir: str,
+    meta_dir: str,
+    tags_dir: str,
+    username: str,
+    db_param: object,
+    refresh_existing: bool = False,
 ):
     global user
     user = username
@@ -770,13 +886,16 @@ def append_data(
     ls_new_exp = []
     for meta, data, tags in tqdm(meta_list, desc="Experiments"):
         exp_name = os.path.basename(data)[:-3]
-        # check if meta already in database
-        if len(Experiment & {"exp_name": exp_name}) == 1:
+        existing = Experiment & {"exp_name": exp_name}
+        if len(existing) == 1 and not refresh_existing:
             print(f"Already in database: {exp_name}")
             continue
 
+        if len(existing) == 1 and refresh_existing:
+            print(f"Refreshing existing experiment: {exp_name}")
+            existing.delete(prompt=False)
+
         print("Adding", meta, flush=True)
-        # not in database, add to database
         with open(meta, "r") as f:
             meta_dict = json.load(f)
         with open(tags, "r") as f:

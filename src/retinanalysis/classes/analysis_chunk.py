@@ -2,6 +2,7 @@ import retinanalysis
 from retinanalysis._database import schema
 import os
 from retinanalysis.config.settings import ANALYSIS_DIR, DATA_DIR
+from retinanalysis.utils.vision_utils import _resolve_vision_data_path
 import pandas as pd
 from retinanalysis.utils.vision_utils import get_analysis_vcd, get_ells, get_timecourses
 from hdf5storage import loadmat
@@ -92,7 +93,7 @@ class AnalysisChunk:
 
         self.exp_name = exp_name
         self.chunk_name = chunk_name
-        self.ss_version = ss_version
+        self.ss_version = self._resolve_ss_version(chunk_name, ss_version)
 
         # Pull Experiment ID
         exp_id = schema.Experiment() & {"exp_name": self.exp_name}
@@ -180,13 +181,38 @@ class AnalysisChunk:
         if b_load_spatial_maps:
             self.get_spatial_maps()
 
+    def _resolve_ss_version(self, chunk_name: str, requested_ss_version: str) -> str:
+        # Adapted to choose a real spike-sorting folder automatically when the notebook uses the old default version.
+        if requested_ss_version and os.path.isdir(
+            os.path.join(DATA_DIR, self.exp_name, requested_ss_version, chunk_name)
+        ):
+            return requested_ss_version
+
+        candidate_versions = ["kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined"]
+        for version in candidate_versions:
+            if os.path.isdir(os.path.join(DATA_DIR, self.exp_name, version, chunk_name)):
+                return version
+            if os.path.isdir(os.path.join(ANALYSIS_DIR, self.exp_name, chunk_name, version)):
+                return version
+        return requested_ss_version or "kilosort2.5"
+
     def get_noise_params(self):
         """
         Method for accessing spatial noise and STA parameters, and correcting for any
         discrepancy due to cropping.
+
+        If the chunk's globals file has no RTMP (runtime movie parameters) tag,
+        self.vcd.runtimemovie_params is None (see get_analysis_vcd() in vision_utils.py).
+        In that case we assume the STA grid was never cropped relative to the full noise
+        grid: staXChecks/staYChecks default to numXChecks/numYChecks, so
+        deltaXChecks/deltaYChecks come out to 0. A warning is printed whenever this
+        fallback is used.
         """
-        self.staXChecks = int(self.vcd.runtimemovie_params.width)
-        self.staYChecks = int(self.vcd.runtimemovie_params.height)
+        has_rtmp = self.vcd.runtimemovie_params is not None
+
+        if has_rtmp:
+            self.staXChecks = int(self.vcd.runtimemovie_params.width)
+            self.staYChecks = int(self.vcd.runtimemovie_params.height)
 
         # Pull epoch block and epoch to get num X and num Y checks used in noise
         epoch_blocks = schema.EpochBlock() & {
@@ -214,17 +240,35 @@ class AnalysisChunk:
                 "WARNING: Not all epoch blocks used the same number of X and Y checks\n"
             )
 
-            vision_micronsPerStixel = self.vcd.runtimemovie_params.micronsPerStixelX
             gridSizes = np.array(
                 [epoch.to_arrays("parameters")[0]["gridSize"] for epoch in epochs]
             )
 
-            self.numXChecks = int(numXChecks[gridSizes == vision_micronsPerStixel])
-            self.numYChecks = int(numYChecks[gridSizes == vision_micronsPerStixel])
+            if has_rtmp:
+                vision_micronsPerStixel = self.vcd.runtimemovie_params.micronsPerStixelX
+                self.numXChecks = int(numXChecks[gridSizes == vision_micronsPerStixel])
+                self.numYChecks = int(numYChecks[gridSizes == vision_micronsPerStixel])
+            else:
+                print(
+                    "WARNING: No RTMP tag available to disambiguate which grid size "
+                    "was used; defaulting to the first epoch block's numXChecks/"
+                    "numYChecks.\n"
+                )
+                self.numXChecks = int(numXChecks[0])
+                self.numYChecks = int(numYChecks[0])
 
         else:
             self.numXChecks = int(numXChecks[0])
             self.numYChecks = int(numYChecks[0])
+
+        if not has_rtmp:
+            print(
+                "WARNING: Globals file has no RTMP tag; assuming the STA grid was NOT "
+                "cropped relative to the full noise grid (staXChecks = numXChecks, "
+                "staYChecks = numYChecks, so deltaXChecks = deltaYChecks = 0).\n"
+            )
+            self.staXChecks = self.numXChecks
+            self.staYChecks = self.numYChecks
 
         self.deltaXChecks = int((self.numXChecks - self.staXChecks) / 2)
         self.deltaYChecks = int((self.numYChecks - self.staYChecks) / 2)
@@ -236,16 +280,31 @@ class AnalysisChunk:
         noise_data_dirs = epoch_blocks.to_arrays("data_dir")
         self.data_files = [os.path.basename(path) for path in noise_data_dirs]
 
-        # Pull typing files directly from available Analysis Directory... avoids issues with datajoint
+        # Pull typing files directly from available analysis directories... avoids issues with datajoint
         # not updating typing files on existing experiments
-        typing_file_dir = os.path.join(
-            ANALYSIS_DIR, self.exp_name, self.chunk_name, self.ss_version
-        )
-        self.typing_files = [
-            file
-            for file in os.listdir(typing_file_dir)
-            if "txt" in os.path.splitext(file)[1]
+        candidate_typedirs = [
+            os.path.join(ANALYSIS_DIR, self.exp_name, self.chunk_name, self.ss_version),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, self.ss_version),
+            os.path.join(DATA_DIR, self.exp_name, self.ss_version, self.chunk_name),
+            os.path.join(ANALYSIS_DIR, self.exp_name, self.chunk_name),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name),
+            os.path.join(ANALYSIS_DIR, self.exp_name, self.ss_version),
+            os.path.join(DATA_DIR, self.exp_name, self.ss_version),
         ]
+        typing_files = []
+        seen_files = set()
+        for typing_dir in candidate_typedirs:
+            if not os.path.isdir(typing_dir):
+                continue
+            for file in os.listdir(typing_dir):
+                if not file.endswith(".txt"):
+                    continue
+                if file in seen_files:
+                    continue
+                seen_files.add(file)
+                typing_files.append(file)
+
+        self.typing_files = typing_files
 
         # typing_files = schema.CellTypeFile() & {'chunk_id' : self.chunk_id, 'algorithm': self.ss_version}
         # self.typing_files = [file_name for file_name in typing_files.fetch('file_name')]
@@ -321,8 +380,11 @@ class AnalysisChunk:
         return arr_ids
 
     def get_df(self):
-        """
-        Internal method for generating the cell params dataframe accessible as self.df_cell_params
+        # Adapted to keep cell typing working when typing files are relocated under newer layouts.
+        """Build the cell-parameter dataframe while tolerating newer analysis layouts.
+
+        This change keeps the notebook workflow working when typing files live under a
+        data-directory-based path rather than the older chunk-root layout.
         """
         center_x = [self.rf_params[id]["center_x"] for id in self.cell_ids]
         center_y = [self.rf_params[id]["center_y"] for id in self.cell_ids]
@@ -344,40 +406,128 @@ class AnalysisChunk:
         cell_types = cell_types_list["cell_types"].values
 
         for idx, typing_file in enumerate(self.typing_files):
-            file_path = os.path.join(
-                ANALYSIS_DIR,
-                self.exp_name,
-                self.chunk_name,
-                self.ss_version,
-                typing_file,
-            )
+            file_path = self._resolve_typing_file_path(typing_file)
             d_result = dict()
+
+            if file_path is None or not os.path.isfile(file_path):
+                classification = ["Unknown"] * len(self.cell_ids)
+                df_dict[f"typing_file_{idx}"] = classification
+                continue
 
             with open(file_path, "r") as file:
                 for line in file:
-                    # Split each line into key and value using the specified delimiter
-                    key, value = map(str.strip, line.split(" ", 1))
-                    sub_values = value.split("/")
+                    if not line.strip():
+                        continue
+                    parts = line.split(" ", 1)
+                    if len(parts) != 2:
+                        continue
+                    key, value = map(str.strip, parts)
+                    sub_values = [s.strip() for s in value.split("/") if s.strip()]
+                    d_result[int(key)] = sub_values
 
-                    # Add key-value pair to the dictionary
-                    d_result[int(key)] = sub_values[:-1]
+            # Normalize cell type tokens for matching
+            # CHANGED 2026-07-30 (Claude, per yas -- she noticed some cell types show up far
+            # less often than expected and hypothesized the classification file isn't always
+            # written the same way, e.g. "brisk sustained" vs. "brisk-sustained"): matching
+            # used to be a literal `part in norm_cell_types_lower` check, so any hyphen,
+            # underscore, or run of extra whitespace in the raw classification file (instead of
+            # a single plain space, matching cell_types.csv exactly) silently fell through to
+            # "Unknown" with no warning. _normalize_type_token() below makes hyphens/underscores
+            # equivalent to spaces and collapses repeated whitespace before comparing, on BOTH
+            # sides (raw file tokens and the CSV vocabulary), so "brisk-sustained",
+            # "brisk_sustained", and "brisk  sustained" all now match the CSV's "brisk
+            # sustained" the same as a literal space would. This only WIDENS matching (things
+            # that used to match still match identically); it cannot cause two previously-
+            # distinct types to collide, since it doesn't touch letters or the on/off prefix.
+            def _normalize_type_token(s: str) -> str:
+                return " ".join(s.replace("-", " ").replace("_", " ").split())
+
+            norm_cell_types = [ct.strip() for ct in cell_types]
+            norm_cell_types_lower = [
+                _normalize_type_token(ct.lower()) for ct in norm_cell_types
+            ]
+            unmatched_raw_tokens: set = set()
+
+            def pick_type_from_parts(parts_list: list[str]) -> str:
+                parts_lower = [_normalize_type_token(p.lower()) for p in parts_list]
+                # find base type and optional on/off prefix
+                base = None
+                for part in parts_lower:
+                    if part in norm_cell_types_lower:
+                        base = norm_cell_types[norm_cell_types_lower.index(part)]
+                        break
+                prefix = None
+                for part in parts_lower:
+                    if part in ("on", "off"):
+                        prefix = part
+                        break
+                # prefer explicit combined labels like 'on/brisk sustained' if present in CSV
+                if prefix and base:
+                    combined = f"{prefix}/{base}"
+                    for ct in norm_cell_types:
+                        if _normalize_type_token(ct.lower()) == _normalize_type_token(
+                            combined.lower()
+                        ):
+                            return ct
+                    # if combined not in CSV, still return combined string so downstream can match
+                    return combined
+                # otherwise prefer base type if found
+                if base:
+                    return base
+                # Nothing matched -- record the raw (non-on/off, non-structural) tokens that
+                # failed, so a verbose run can tell yas exactly which raw strings need a
+                # cell_types.csv entry or turn out to be a formatting variant like the hyphen
+                # case above. "all" is skipped -- it's the fixed top-level bin every line is
+                # written under (e.g. "All/on/brisk sustained"), not a candidate type name, so
+                # it would otherwise show up as a false "unmatched" entry on every single line.
+                for part, raw_part in zip(parts_lower, parts_list):
+                    if part not in ("on", "off", "all") and part != "":
+                        unmatched_raw_tokens.add(raw_part)
+                return "Unknown"
 
             for cell in self.cell_ids:
                 if cell in d_result.keys():
-                    for type in cell_types:
-                        if type in d_result[cell]:
-                            d_result[cell] = type
-                            break
+                    chosen = pick_type_from_parts(d_result[cell])
+                    d_result[cell] = chosen
                 else:
                     d_result[cell] = "Unknown"
 
-                if "All" in d_result[cell]:
-                    d_result[cell] = "Unknown"
+            # Always printed (not gated behind self.verbose) -- same policy as the RTMP-missing
+            # warning in get_analysis_vcd(): this is a data-integrity-relevant signal (some raw
+            # classification labels are being silently dropped to "Unknown"), not routine
+            # logging, so it shouldn't be hidden by default.
+            if unmatched_raw_tokens:
+                print(
+                    f"[{typing_file}] {len(unmatched_raw_tokens)} raw classification token(s) "
+                    "did not match any cell_types.csv entry (even after normalizing "
+                    "hyphens/underscores/extra spaces) and were classified 'Unknown': "
+                    f"{sorted(unmatched_raw_tokens)}"
+                )
 
-            classification = [d_result[cell] for cell in self.cell_ids]
+            classification = [d_result.get(cell, "Unknown") for cell in self.cell_ids]
             df_dict[f"typing_file_{idx}"] = classification
 
         self.df_cell_params = pd.DataFrame(df_dict)
+
+    def _resolve_typing_file_path(self, typing_file: str) -> Optional[str]:
+        # Adapted to search both legacy and newer analysis-directory patterns.
+        """Resolve typing-file locations across legacy and newer analysis layouts."""
+        candidate_dirs = [
+            os.path.join(ANALYSIS_DIR, self.exp_name, self.chunk_name, self.ss_version),
+            os.path.join(ANALYSIS_DIR, self.exp_name, self.ss_version, self.chunk_name),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, self.ss_version),
+            os.path.join(DATA_DIR, self.exp_name, self.ss_version, self.chunk_name),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, "ksfiles"),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, "kilosort2.5"),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, "kilosort25"),
+            os.path.join(DATA_DIR, self.exp_name, self.chunk_name, "kilosort40"),
+        ]
+        for directory in candidate_dirs:
+            candidate = os.path.join(directory, typing_file)
+            if os.path.isfile(candidate):
+                return candidate
+        return None
 
     def get_spatial_maps(self, ls_channels=[0, 2]):
         # By default load red and blue channel spatial maps.

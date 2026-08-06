@@ -20,6 +20,40 @@ import xarray as xr
 from collections import Counter
 
 
+def _resolve_vision_data_path(exp_name: str, chunk_name: str, ss_version: str) -> str:
+    requested_versions = [version for version in [ss_version] if version]
+    candidate_versions = list(dict.fromkeys(requested_versions + ["kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined"]))
+
+    candidate_dirs = []
+    for version in candidate_versions:
+        candidate_dirs.extend(
+            [
+                os.path.join(ANALYSIS_DIR, exp_name, chunk_name, version),
+                os.path.join(DATA_DIR, exp_name, chunk_name, version),
+                os.path.join(DATA_DIR, exp_name, version, chunk_name),
+                os.path.join(ANALYSIS_DIR, exp_name, version, chunk_name),
+                os.path.join(DATA_DIR, exp_name, version),
+                os.path.join(ANALYSIS_DIR, exp_name, version),
+            ]
+        )
+
+    candidate_dirs.extend(
+        [
+            os.path.join(DATA_DIR, exp_name, chunk_name),
+            os.path.join(DATA_DIR, exp_name, chunk_name, "ksfiles"),
+            os.path.join(DATA_DIR, exp_name, chunk_name, "kilosort2.5"),
+            os.path.join(DATA_DIR, exp_name, chunk_name, "kilosort25"),
+            os.path.join(DATA_DIR, exp_name, chunk_name, "kilosort40"),
+            os.path.join(ANALYSIS_DIR, exp_name, chunk_name),
+        ]
+    )
+
+    for candidate in candidate_dirs:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidate_dirs[0] if candidate_dirs else os.path.join(DATA_DIR, exp_name, chunk_name, ss_version)
+
+
 def get_analysis_vcd(
     exp_name: str,
     chunk_name: str,
@@ -29,21 +63,50 @@ def get_analysis_vcd(
     verbose: bool = True,
 ) -> VisionCellDataTable:
 
-    data_path = os.path.join(ANALYSIS_DIR, exp_name, chunk_name, ss_version)
+    data_path = _resolve_vision_data_path(exp_name, chunk_name, ss_version)
 
     if verbose:
         print(f"Loading VCD from {data_path} ...")
 
-    vcd = load_vision_data(
-        data_path,
-        ss_version,
-        include_ei=include_ei,
-        include_noise=False,
-        include_sta=False,
-        include_params=True,
-        include_runtimemovie_params=True,
-        include_neurons=include_neurons,
-    )
+    dataset_name = chunk_name
+    if not os.path.isdir(data_path):
+        dataset_name = ss_version
+    elif not os.path.isfile(os.path.join(data_path, f"{dataset_name}.globals")):
+        dataset_name = ss_version
+
+    try:
+        vcd = load_vision_data(
+            data_path,
+            dataset_name,
+            include_ei=include_ei,
+            include_noise=False,
+            include_sta=False,
+            include_params=True,
+            include_runtimemovie_params=True,
+            include_neurons=include_neurons,
+        )
+    except AssertionError as e:
+        if "RTMP tag" not in str(e):
+            raise
+        # Globals file has no runtime movie parameters (RTMP tag). Load without them;
+        # vcd.runtimemovie_params will be None. AnalysisChunk.get_noise_params() falls
+        # back to assuming no STA cropping in this case.
+        if verbose:
+            print(
+                "WARNING: Globals file has no RTMP tag, loading without runtime movie "
+                "parameters. STA-crop correction will assume no cropping "
+                "(see get_noise_params())."
+            )
+        vcd = load_vision_data(
+            data_path,
+            dataset_name,
+            include_ei=include_ei,
+            include_noise=False,
+            include_sta=False,
+            include_params=True,
+            include_runtimemovie_params=False,
+            include_neurons=include_neurons,
+        )
 
     if verbose:
         print(f"VCD loaded with {len(vcd.get_cell_ids())} cells.\n")
@@ -59,7 +122,20 @@ def get_protocol_vcd(
     verbose: bool = True,
 ) -> VisionCellDataTable:
 
-    data_path = os.path.join(DATA_DIR, exp_name, datafile_name, ss_version)
+    resolved_ss_version = ss_version or "kilosort2.5"
+    candidate_dirs = [
+        os.path.join(DATA_DIR, exp_name, resolved_ss_version, datafile_name),
+        os.path.join(DATA_DIR, exp_name, "kilosort25", datafile_name),
+        os.path.join(DATA_DIR, exp_name, "kilosort40", datafile_name),
+        os.path.join(DATA_DIR, exp_name, datafile_name, resolved_ss_version),
+        os.path.join(DATA_DIR, exp_name, datafile_name),
+        os.path.join(DATA_DIR, exp_name, resolved_ss_version),
+        os.path.join(ANALYSIS_DIR, exp_name, resolved_ss_version, datafile_name),
+        os.path.join(ANALYSIS_DIR, exp_name, "kilosort25", datafile_name),
+        os.path.join(ANALYSIS_DIR, exp_name, datafile_name, resolved_ss_version),
+        os.path.join(ANALYSIS_DIR, exp_name, resolved_ss_version),
+    ]
+    data_path = next((path for path in candidate_dirs if os.path.isdir(path)), candidate_dirs[0])
 
     if verbose:
         print(f"Loading VCD from {data_path} ...")

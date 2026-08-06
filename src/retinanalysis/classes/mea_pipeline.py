@@ -58,9 +58,17 @@ class MEAPipeline:
         typing_file: Optional[str] = None,
         verbose: bool = True,
         pkl_file: Optional[str] = None,
+        corr_cutoff: float = 0.8,
     ):
 
         self.verbose = verbose
+        # NEW 2026-07-30 (Claude, per yas -- "the ei mapping threshold should be
+        # set just like it is in my matlab notebook"): this used to be silently
+        # hardcoded to cluster_match's own default (0.8) with no way to override
+        # it from create_mea_pipeline/MEAPipeline at all -- yas's MATLAB scripts
+        # use corr_threshold=0.85. Default kept at 0.8 so nothing that doesn't
+        # pass this explicitly changes behavior.
+        self.corr_cutoff = corr_cutoff
 
         # If loading from pickle file, load as dict and generate stim, resp, and analysis_chunk
         # It not, throw value error if stim, resp, or analysis_chunk inputs are None
@@ -107,7 +115,7 @@ class MEAPipeline:
                 self.corr_dict = {id: 1.0 for id in self.analysis_chunk.cell_ids}
             else:
                 self.match_dict, self.corr_dict = cluster_match(
-                    self.analysis_chunk, self.resp, verbose=self.verbose
+                    self.analysis_chunk, self.resp, corr_cutoff=self.corr_cutoff, verbose=self.verbose
                 )
         elif isinstance(self.resp, MEAResponseGroup):
             if all(
@@ -120,7 +128,7 @@ class MEAPipeline:
                 self.corr_dict = {id: 1.0 for id in self.analysis_chunk.cell_ids}
             else:
                 self.match_dict, self.corr_dict = cluster_match(
-                    self.analysis_chunk, self.resp, verbose=self.verbose
+                    self.analysis_chunk, self.resp, corr_cutoff=self.corr_cutoff, verbose=self.verbose
                 )
 
         # Add noise_ids from match dict to response block df_spike_times dataframe
@@ -719,6 +727,7 @@ def create_mea_pipeline(
     b_load_fd: bool = False,
     b_LED: bool = False,
     verbose: bool = True,
+    corr_cutoff: float = 0.8,
 ):
     """
     Helper function for initializing an MEAPipeline from metadata.
@@ -739,6 +748,13 @@ def create_mea_pipeline(
         ls_params (List): List of epoch parameters to pull into their own column in the MEAStimBlock.df_epochs
         DataFrame. By default parameters that change with each epoch are already pulled, but additional params
         can be specified in this list.
+
+        corr_cutoff (float): NEW 2026-07-30 (Claude, per yas). EI-correlation cutoff used to match
+        cells between the analysis_chunk (reference/noise chunk) and this datafile's response block,
+        passed straight through to cluster_match()'s corr_cutoff. Default 0.8, matching cluster_match's
+        own previous (silently hardcoded, unoverridable) default -- set this to match your own lab's
+        convention (e.g. 0.85, matching yas's MATLAB corr_threshold) if you want stricter/looser
+        cross-chunk cell matching.
 
     Returns:
         MEAPipeline object that contains the MEAStimBlock and MEAResponse block for the given datafile, and
@@ -785,12 +801,24 @@ def create_mea_pipeline(
     )
 
     if analysis_chunk_name is None:
-        analysis_chunk_name = s.nearest_noise_chunk
+        analysis_chunk_name = getattr(s, "nearest_noise_chunk", None)
+        if analysis_chunk_name is None:
+            analysis_chunk_name = getattr(s, "datafile_name", None)
+        if analysis_chunk_name is None and isinstance(datafile_name, str):
+            analysis_chunk_name = datafile_name
+        if analysis_chunk_name is None and isinstance(datafile_name, list):
+            analysis_chunk_name = datafile_name[0] if datafile_name else None
         if verbose:
             print(f"Using {analysis_chunk_name} for AnalysisChunk\n")
 
+    if analysis_chunk_name is None:
+        raise ValueError(
+            "Unable to determine an analysis chunk for this pipeline."
+        )
+
     ac = AnalysisChunk(exp_name, analysis_chunk_name, ss_version, verbose=verbose)
     pipeline = MEAPipeline(
-        stim=s, resp=r, analysis_chunk=ac, typing_file=typing_file, verbose=verbose
+        stim=s, resp=r, analysis_chunk=ac, typing_file=typing_file, verbose=verbose,
+        corr_cutoff=corr_cutoff,
     )
     return pipeline

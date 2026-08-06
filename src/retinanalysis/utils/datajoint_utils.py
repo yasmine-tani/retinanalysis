@@ -6,6 +6,7 @@ import datajoint as dj
 import os
 import pandas as pd
 import json
+import re
 import warnings
 from tqdm.auto import tqdm
 from IPython.display import display
@@ -13,89 +14,242 @@ import h5py
 from typing import List, Optional
 
 
+# Default keywords used to drop "not a real cell type" labels (catch-all / low-confidence
+# classifier bins) from the auto-detected cell type list in plot_mosaics_for_datasets. Case
+# insensitive. "nc" is matched as a whole token (optionally followed by digits, e.g. "nc17")
+# rather than as a plain substring, to avoid accidentally matching inside an unrelated type
+# name. The rest are matched as plain substrings so they also catch compound labels like
+# "OnLarge" or "BigMas". Override by passing exclude_cell_type_keywords= to
+# plot_mosaics_for_datasets, or edit this list if your lab's junk-bin vocabulary differs.
+DEFAULT_EXCLUDED_CELL_TYPE_KEYWORDS = ["unknown", "nc", "large", "big", "huge", "weak"]
+
+
+def _should_exclude_cell_type(cell_type: str, exclude_keywords: List[str]) -> bool:
+    """
+    Returns True if cell_type looks like a catch-all/low-confidence label that should be
+    dropped from an auto-detected cell type list, based on exclude_keywords.
+    """
+    ct_lower = str(cell_type).lower()
+    for kw in exclude_keywords:
+        kw_lower = kw.lower()
+        if kw_lower == "nc":
+            if re.search(r"(?<![a-z])nc\d*(?![a-z])", ct_lower):
+                return True
+        elif kw_lower in ct_lower:
+            return True
+    return False
+
+
 def plot_mosaics_for_datasets(
     df_exp_search: pd.DataFrame,
-    cell_types: List[str] = ["OnP", "OffP", "OnM", "OffM"],
+    cell_types: Optional[List[str]] = None,
     preferred_typing_file: Optional[str] = None,
+    exclude_cell_type_keywords: Optional[List[str]] = None,
+    verbose: bool = False,
     **kwargs,
 ):
     """
     Function for plotting mosaics across datasets listed in an experiment search dataframe.
-    The function usese the nearest noise chunk by default, and the user can specify a list of
-    cell types and a preferred typing file. Additional kwargs are fed into plot_rf function.
+
+    CHANGED 2026-07-28 (Claude, per yas): this function used to resolve, for every row of
+    df_exp_search, the "nearest" noise chunk by time-distance and would silently substitute
+    a different chunk if the requested one failed to load (e.g. due to a missing RTMP tag).
+    Because df_exp_search can contain several rows per experiment (one per epoch block), many
+    rows would resolve to the very same fallback chunk, so the same mosaic could get plotted
+    two or three times in a row. It also defaulted cell_types to a hardcoded, project-specific
+    list (['OnP','OffP','OnM','OffM']) that didn't match this lab's actual classification
+    labels.
+
+    New behavior:
+    - Every unique (exp_name, chunk_name) pair present in df_exp_search is attempted at most
+      once. There is no cross-chunk substitution: if a chunk fails to load, it is skipped
+      (with a printed message) and the next chunk for that same experiment is tried. This is
+      what actually prevents duplicate mosaics, instead of masking the problem by only ever
+      plotting the first chunk found.
+    - A chunk is only plotted if it has at least one classification/typing file (any file in
+      analysis_chunk.typing_files whose name contains "classification", case-insensitive).
+      Chunks without a classification file are skipped silently (they're not failures, just
+      not usable for mosaics). If NONE of an experiment's chunks have a classification file,
+      that is reported once for the whole experiment.
+    - If a chunk has more than one classification file (i.e. more than one person typed it),
+      a mosaic is plotted for each one, unless preferred_typing_file is given and present.
+    - Each plotted mosaic's title reports the experiment, chunk, NDF (light level) pulled from
+      the 'NDF' column of df_exp_search, and which classification file was used.
+    - cell_types now defaults to None. UPDATED 2026-07-28 (Claude, per yas): when None, this
+      no longer means "plot literally every type string found" -- it means "auto-detect every
+      type present, then drop catch-all/low-confidence labels" (see exclude_cell_type_keywords
+      below). Pass an explicit cell_types=[...] list yourself to bypass this filtering
+      entirely and plot exactly those types.
+    - Console output is now much shorter: chunk loading uses a single tqdm progress bar
+      instead of printing "Loading VCD..." / "VCD loaded with N cells" for every chunk, so
+      you don't have to scroll past a wall of text to reach the actual mosaic figures. Set
+      verbose=True to get the old per-chunk loading detail back (useful for debugging).
+
+    This redesign is scoped to this function only. Chunk selection used elsewhere (e.g.
+    create_mea_pipeline / single-experiment setup, or matching a noise chunk to a non-noise
+    protocol like PresentImages) is untouched.
 
     Parameters:
     df_exp_search (pandas.DataFrame): an exp_search dataframe generated by the
-    get_datasets_from_protocol_names function.
+    get_datasets_from_protocol_names function. Must contain 'exp_name' and 'chunk_name'
+    columns; 'NDF' and 'block_id' are used if present (NDF for labeling, block_id to sort
+    chunks chronologically within an experiment).
 
-    cell_types (List[int]): A list of cell types to plot. Default plots On and Off M and P cells
+    cell_types (Optional[List[str]]): An explicit list of cell types to plot. Default None,
+    which auto-detects every cell type present in the classification file being plotted and
+    then removes catch-all/low-confidence labels per exclude_cell_type_keywords. If you pass
+    your own list, it is used exactly as given -- exclude_cell_type_keywords is NOT applied,
+    since you've already told the function exactly what you want.
 
-    preferred_typing_file (str): The name of a preferred cell typing .txt file. If that file is not
-    found the function will let you know and use an alternate (if available).
+    preferred_typing_file (str): The name of a preferred cell typing .txt file. If a given
+    chunk doesn't have this file, all of that chunk's available classification file(s) are
+    plotted instead (with a printed note), rather than silently falling back to just the
+    first one.
+
+    exclude_cell_type_keywords (Optional[List[str]]): Keywords (case-insensitive) used to
+    drop catch-all/low-confidence labels from the auto-detected cell type list when
+    cell_types is None. Default is DEFAULT_EXCLUDED_CELL_TYPE_KEYWORDS = ['unknown', 'nc',
+    'large', 'big', 'huge', 'weak']. 'nc' is matched as a whole token (so it also catches
+    'nc17', but won't match inside an unrelated word); the rest are matched as substrings (so
+    'large' also catches 'OnLarge'). Define your own list and pass it in if this lab's set of
+    junk-bin labels changes -- e.g. at the top of a notebook:
+        EXCLUDE_CELL_TYPES = ['unknown', 'nc', 'large', 'big', 'huge', 'weak']
+        ra.plot_mosaics_for_datasets(exp_search, exclude_cell_type_keywords=EXCLUDE_CELL_TYPES, ...)
+    If, after exclusion, a chunk has zero cell types left to plot, that chunk/typing_file
+    combination is skipped (reported once) rather than producing an empty figure.
+
+    verbose (bool): If True, restores the old per-chunk "Loading VCD..." console output.
+    Default False (a single compact progress bar is shown instead).
 
     **kwargs: key value pairs of params fed into the analysis_chunk.plot_rfs function such as
     b_zoom and minimum_n.
 
     Returns:
-    ls_rf_axes (List[Axes]): A list of axes, one for each of the plotted datasets.
+    ls_rf_axes (List[Axes]): A list of axes, one entry per (experiment, chunk, classification
+    file) that was actually plotted.
     """
 
-    exp_names = df_exp_search["exp_name"].values
-    datafile_names = df_exp_search["datafile_name"].values
+    required_cols = {"exp_name", "chunk_name"}
+    missing_cols = required_cols - set(df_exp_search.columns)
+    if missing_cols:
+        raise ValueError(
+            f"df_exp_search is missing required column(s): {sorted(missing_cols)}. "
+            "Use get_datasets_from_protocol_names() to build a compatible dataframe."
+        )
 
     from retinanalysis.classes.analysis_chunk import AnalysisChunk
 
+    exclude_keywords = (
+        DEFAULT_EXCLUDED_CELL_TYPE_KEYWORDS
+        if exclude_cell_type_keywords is None
+        else exclude_cell_type_keywords
+    )
+
     ls_rf_axes = []
-    for e_idx, exp in enumerate(exp_names):
-        exp_summary = get_exp_summary(exp)
-        assert exp_summary is not None
 
-        noise_protocol_name = get_noise_name_by_exp(exp)
-        sorted_chunks, _ = get_noise_chunks_sorted_by_distance(
-            exp_summary, datafile_names[e_idx], noise_protocol_name=noise_protocol_name
-        )
+    # Build the full (exp_name, chunk_name, NDF) candidate list up front so the progress bar
+    # below reflects real work (one tick per chunk actually attempted), not one tick per
+    # experiment regardless of how many chunks it has.
+    ls_candidates = []
+    for exp in df_exp_search["exp_name"].unique():
+        df_exp_rows = df_exp_search.query("exp_name == @exp")
 
-        analysis_chunk = None
-        for nearest_chunk in sorted_chunks:
-            try:
-                analysis_chunk = AnalysisChunk(
-                    exp,
-                    nearest_chunk,
-                    b_load_spatial_maps=False,
-                    include_ei=False,
-                    include_neurons=False,
-                    verbose=True,
-                )
-                break
-            except Exception as e:
-                print(
-                    f"Could not use chunk {nearest_chunk}, trying next nearest. Error: {e}"
-                )
+        # One row per unique chunk in this experiment. Sorting by block_id (if available)
+        # keeps plotting order chronological instead of depending on row order in the input.
+        dedup_cols = [
+            c for c in ["chunk_name", "NDF", "block_id"] if c in df_exp_rows.columns
+        ]
+        df_chunks = df_exp_rows.drop_duplicates(subset="chunk_name")[dedup_cols]
+        if "block_id" in df_chunks.columns:
+            df_chunks = df_chunks.sort_values("block_id")
 
-        if analysis_chunk is None:
-            print(f"Could not load any noise chunk for {exp}")
-            return
-        nearest_chunk = analysis_chunk.chunk_name
+        for _, chunk_row in df_chunks.iterrows():
+            ls_candidates.append((exp, chunk_row))
 
-        if preferred_typing_file is None:
-            rf_axes = analysis_chunk.plot_rfs(cell_types=cell_types, **kwargs)
-        else:
-            try:
-                rf_axes = analysis_chunk.plot_rfs(
-                    cell_types=cell_types, typing_file=preferred_typing_file, **kwargs
-                )
-            except:
-                print(
-                    f"{preferred_typing_file} does not exist for {exp} {nearest_chunk}, using {analysis_chunk.typing_files[0]}"
-                )
-                rf_axes = analysis_chunk.plot_rfs(cell_types=cell_types, **kwargs)
+    classified_exps = set()
+    checked_exps = set()
+
+    pbar = tqdm(ls_candidates, desc="Checking noise chunks for classification files")
+    for exp, chunk_row in pbar:
+        chunk_name = chunk_row["chunk_name"]
+        checked_exps.add(exp)
+        ndf = chunk_row["NDF"] if "NDF" in chunk_row.index else None
+        ndf_label = f"NDF {ndf}" if ndf is not None and not pd.isna(ndf) else "NDF unknown"
+        pbar.set_postfix_str(f"{exp} {chunk_name}")
 
         try:
+            analysis_chunk = AnalysisChunk(
+                exp,
+                chunk_name,
+                b_load_spatial_maps=False,
+                include_ei=False,
+                include_neurons=False,
+                verbose=verbose,
+            )
+        except Exception as e:
+            tqdm.write(
+                f"Could not load chunk {chunk_name} for {exp} ({ndf_label}), skipping. Error: {e}"
+            )
+            continue
+
+        # Only treat files that look like classification/typing files as usable. This is
+        # a local filter (doesn't change AnalysisChunk.typing_files itself) since typing
+        # file naming isn't fully consistent, but always contains "classification".
+        classification_files = [
+            f for f in analysis_chunk.typing_files if "classification" in f.lower()
+        ]
+
+        if not classification_files:
+            continue
+
+        classified_exps.add(exp)
+
+        if preferred_typing_file is not None and preferred_typing_file in classification_files:
+            files_to_plot = [preferred_typing_file]
+        else:
+            if preferred_typing_file is not None:
+                tqdm.write(
+                    f"{preferred_typing_file} not found for {exp} {chunk_name}, plotting "
+                    f"all available classification file(s) instead: {classification_files}"
+                )
+            files_to_plot = classification_files
+
+        for typing_file in files_to_plot:
+            plot_cell_types = cell_types
+
+            if plot_cell_types is None:
+                # Auto-detect: pull every type actually present in this typing file, then
+                # drop catch-all/low-confidence labels (see exclude_cell_type_keywords).
+                typing_file_idx = analysis_chunk.typing_files.index(typing_file)
+                all_types_present = sorted(
+                    analysis_chunk.df_cell_params[f"typing_file_{typing_file_idx}"].unique()
+                )
+                plot_cell_types = [
+                    ct for ct in all_types_present
+                    if not _should_exclude_cell_type(ct, exclude_keywords)
+                ]
+
+                if not plot_cell_types:
+                    tqdm.write(
+                        f"No cell types of interest (after excluding {exclude_keywords}) for "
+                        f"{exp} {chunk_name} ({typing_file}, {ndf_label}), skipping."
+                    )
+                    continue
+
+            rf_axes = analysis_chunk.plot_rfs(
+                cell_types=plot_cell_types, typing_file=typing_file, **kwargs
+            )
+
+            if rf_axes is None or len(rf_axes) == 0:
+                tqdm.write(f"No RFs for {exp} {chunk_name} ({typing_file}, {ndf_label})")
+                continue
+
             fig = rf_axes[0].get_figure()
-            fig.suptitle(f"{exp} {nearest_chunk}")
+            fig.suptitle(f"{exp} {chunk_name} | {ndf_label} | {typing_file}")
             ls_rf_axes.append(rf_axes)
-        except:
-            print(f"\nNo RFs for {exp} {nearest_chunk}")
+
+    for exp in checked_exps - classified_exps:
+        tqdm.write(f"No classification files found for any noise chunk in {exp}")
 
     return ls_rf_axes
 
@@ -168,10 +322,11 @@ def populate_ndf_column(df_exp_summary):
 
 
 def get_exp_summary(exp_name: str) -> Optional[pd.DataFrame]:
-    """
-    Function for generating an experiment summary dataframe that has a list of all
-    protocols run and their most relevant properties (sorting chunk, datafile name,
-    duration, etc.)
+    """Generate an experiment summary dataframe while tolerating newer sorting layouts.
+
+    This helper now keeps working even when chunk IDs or sorting chunk rows are missing,
+    which is important for the newer data-directory-based structure where chunk folders
+    may not exist in the old form.
 
     Parameters:
     exp_name (str): The experiment name to summarize (i.e. '20251008C')
@@ -181,6 +336,7 @@ def get_exp_summary(exp_name: str) -> Optional[pd.DataFrame]:
     run on that experiment day, their mount, their timing, their sorting chunk, and
     their datafile directory.
     """
+    # Adapted to tolerate missing SortingChunk rows and newer data-directory layouts.
 
     exp_ids = (schema.Experiment() & f'exp_name="{exp_name}"').to_arrays("id")
     if len(exp_ids) == 0:
@@ -228,17 +384,46 @@ def get_exp_summary(exp_name: str) -> Optional[pd.DataFrame]:
 
     epoch_block_query = epoch_group_query * epoch_block_query
 
-    # If MEA experiment, get sorting chunk information
+    # If MEA experiment, get sorting chunk information when available.
+    # The newer sorted-data layout may not populate SortingChunk rows in the old way,
+    # so fall back to empty chunk metadata rather than failing the notebook summary.
     if is_mea:
         sorting_chunk_query = schema.SortingChunk() & f"experiment_id={exp_id}"
         sorting_chunk_query = sorting_chunk_query.proj("chunk_name", chunk_id="id")
-        epoch_block_query = epoch_block_query * sorting_chunk_query
+        if len(sorting_chunk_query) > 0:
+            epoch_block_query = epoch_block_query * sorting_chunk_query
+        else:
+            epoch_block_query = epoch_block_query.proj(
+                ...,
+                chunk_name="" ,
+                chunk_id="",
+            )
     protocol_query = epoch_block_query * schema.Protocol.proj(..., protocol_name="name")  # type: ignore
 
     df_exp_summary = protocol_query.to_pandas().reset_index()
     df_exp_summary = df_exp_summary.sort_values("start_time").reset_index()
     if len(df_exp_summary) == 0:
-        raise ValueError(f"No data found for experiment {exp_name}")
+        print(f"No data found for experiment {exp_name}; returning empty summary.")
+        return pd.DataFrame(columns=[
+            "exp_name",
+            "prep_label",
+            "datafile_name",
+            "group_label",
+            "NDF",
+            "chunk_name",
+            "protocol_name",
+            "duration_minutes",
+            "minutes_since_start",
+            "start_time",
+            "end_time",
+            "data_dir",
+            "experiment_id",
+            "prep_id",
+            "group_id",
+            "block_id",
+            "chunk_id",
+            "protocol_id",
+        ])
 
     # Check that end_time and start_time are in datetime format
     if not pd.api.types.is_datetime64_any_dtype(df_exp_summary["start_time"]):
@@ -352,13 +537,14 @@ def get_block_id_from_datafile(exp_name: str, datafile_name: str):
 
 
 def search_protocol(str_search: str, verbose: bool = True):
-    """Search for symphony protocols by name.
+    """Search for Symphony protocols by name.
 
-    Parmeters:
-    str_search (str): a string contained somewhere inside the protocol name (e.g., PresentImages)
+    Parameters:
+    str_search (str): A substring contained somewhere inside the protocol name.
 
     Returns:
-    matches (List[str]): a list of full protocol names as strings (e.g., manookinlab.protocols.PresentImages)"""
+    matches (List[str]): A list of matching protocol names.
+    """
 
     str_search = str_search.lower()
     protocols = schema.Protocol().to_arrays("name")
@@ -547,6 +733,259 @@ def get_noise_chunks_sorted_by_distance(
     return noise_chunk_names, noise_chunk_distances
 
 
+def find_datafile_for_protocol(
+    df_exp_search: pd.DataFrame,
+    exp_name: str,
+    protocol_name: Optional[str] = None,
+    verbose: bool = True,
+):
+    """
+    NEW 2026-07-29 (Claude, per yas): pick which datafile_name to use for a given
+    experiment out of a dataset-search dataframe, so notebooks don't need the user
+    to type in a specific datafile_name by hand once they've already searched for
+    the protocol they want.
+
+    If there's exactly one matching row for exp_name (and protocol_name, if given),
+    that datafile_name is returned. If there's more than one (the protocol was run
+    more than once that day -- e.g. re-run with different parameters), the earliest
+    one by block_id is used, and every candidate found is printed so it's obvious
+    whether a different one should be picked instead.
+
+    Parameters:
+    df_exp_search (pandas DataFrame): a dataset-search dataframe, e.g. the output of
+    get_datasets_from_protocol_names(). Must have 'exp_name' and 'datafile_name'
+    columns; 'protocol_name' and 'block_id' are used if present (protocol_name to
+    filter, block_id to order candidates chronologically).
+
+    exp_name (str): which experiment to pick a datafile for.
+
+    protocol_name (Optional[str]): if given, further filters df_exp_search to rows
+    with this exact protocol_name before picking. Default None -- no extra
+    filtering, so if df_exp_search might contain more than one protocol's rows
+    (e.g. a broad substring search), pass this to avoid picking a datafile from the
+    wrong protocol.
+
+    verbose (bool): print what was found/chosen. Default True.
+
+    Returns:
+    datafile_name (str or None): the chosen datafile name (e.g. 'data003'), or None
+    if no matching row was found for exp_name (and protocol_name, if given).
+    """
+    matches = df_exp_search.query("exp_name == @exp_name")
+    if protocol_name is not None and "protocol_name" in matches.columns:
+        matches = matches.query("protocol_name == @protocol_name")
+
+    if "datafile_name" in matches.columns:
+        matches = matches.drop_duplicates(subset="datafile_name")
+
+    if len(matches) == 0:
+        if verbose:
+            proto_msg = f' for protocol "{protocol_name}"' if protocol_name else ""
+            print(
+                f"No datafile found for {exp_name}{proto_msg} in the given search "
+                "results."
+            )
+        return None
+
+    if "block_id" in matches.columns:
+        matches = matches.sort_values("block_id")
+
+    chosen = matches.iloc[0]["datafile_name"]
+
+    if verbose:
+        if len(matches) > 1:
+            print(
+                f"{exp_name}: {len(matches)} matching datafiles found: "
+                f"{list(matches['datafile_name'])}. Using the earliest, {chosen}. "
+                "Pass a different datafile_name directly if you want a different one."
+            )
+        else:
+            print(f"{exp_name}: using datafile {chosen}.")
+
+    return chosen
+
+
+def find_classified_noise_chunk(
+    exp_name: str,
+    preferred_ndfs: List[float] = (0, 1),
+    ss_version: str = "kilosort2.5",
+    verbose: bool = True,
+):
+    """
+    NEW 2026-07-28 (Claude, per yas): auto-pick a noise (cell-typing) chunk for an
+    experiment, following this lab's specific convention rather than
+    create_mea_pipeline's default "nearest chunk in time" heuristic. That default
+    can land on a chunk that's a dead/partial recording or simply lacks a
+    classification file, which then crashes downstream (either with "no typing
+    file" or, if the chunk's .globals file is incomplete, "Globals file does not
+    have RTMP tag").
+
+    Convention (per yas, 2026-07-29): prefer the white-noise chunk at NDF 0 that
+    has a classification file. If NDF 0 was never classified (e.g. the recording
+    died before reaching NDF 0, so the lab classified NDF 1 instead), fall back to
+    NDF 1. If more than one chunk at the chosen NDF has a classification file
+    (e.g. white noise was re-run with different parameters and both got
+    classified), the earliest one (by start time) is used, and this prints all the
+    candidates found plus which one was picked, so you can tell at a glance if you
+    want a different one. Nothing beyond NDF 1 is tried automatically -- if
+    neither NDF 0 nor NDF 1 has a classified chunk, this returns None and prints
+    why, rather than guessing further.
+
+    This function only does a filesystem check for classification files (same
+    "any filename containing 'classification', case-insensitive" rule used by
+    plot_mosaics_for_datasets) -- it does NOT instantiate AnalysisChunk or load
+    anything from the .globals file, so it works even for chunks whose .globals
+    file is missing the RTMP tag (which would otherwise make AnalysisChunk crash
+    before you ever found out whether that chunk was classified). Whatever chunk
+    name this returns is meant to be passed straight to
+    create_mea_pipeline(..., analysis_chunk_name=<result>) to skip its own
+    nearest-chunk auto-detection.
+
+    Parameters:
+    exp_name (str): experiment name, e.g. '20250910A'.
+
+    preferred_ndfs (List[float]): NDF values to try, in priority order. Default
+    (0, 1) -- NDF 0 first, NDF 1 as the only fallback. Pass your own list/order if
+    a different lab convention applies (e.g. (0,) to never fall back to NDF 1).
+
+    ss_version (str): spike-sorting version subfolder to look for classification
+    files in, default 'kilosort2.5'. Only used to build the on-disk path -- if
+    that exact folder doesn't exist, common alternates (kilosort25, kilosort40,
+    kilosort4, combined) are tried too, same as AnalysisChunk does.
+
+    verbose (bool): print what was found/chosen and why. Default True -- this is
+    meant to be read, since it's making a choice for you.
+
+    Returns:
+    identifier (str or None): the chosen chunk_name (older experiments that still
+    have real SortingChunk rows, e.g. 'chunk13') or datafile_name (newer
+    experiments where SortingChunk isn't populated, e.g. 'data001' -- see "no
+    more chunks" note below) -- either way, meant to be passed straight to
+    create_mea_pipeline(..., analysis_chunk_name=<result>). Returns None if no
+    classified chunk was found at any of preferred_ndfs.
+    """
+    # CHANGED 2026-07-29 (Claude, per yas -- "we don't have chunks anymore, I
+    # changed the datajoint structure to align with our new one"): this used to
+    # filter to chunk_name.str.contains("chunk"), copied from the existing (never
+    # updated for the new structure) get_nearest_noise() in stim.py. That's wrong
+    # for yas's current schema: get_exp_summary() (see its own comments) now
+    # returns chunk_name="" for any experiment where SortingChunk rows aren't
+    # populated, which is normal for the newer data-directory-based layout where
+    # each datafile (data000, data001, ...) is its own analysis unit rather than
+    # being grouped into named "chunks". A literal "chunk" substring match would
+    # silently exclude every white-noise row for those experiments. Fixed: no
+    # longer filters on chunk_name content at all -- just protocol_name. Uses
+    # chunk_name when it's actually populated (a non-empty string, for older
+    # experiments that do have real SortingChunk rows), otherwise falls back to
+    # datafile_name (for newer experiments), since that's what AnalysisChunk needs
+    # to actually find the right directory on disk either way.
+    from retinanalysis.utils.vision_utils import _resolve_vision_data_path
+
+    df_exp_summary = get_exp_summary(exp_name)
+    if df_exp_summary is None or len(df_exp_summary) == 0:
+        if verbose:
+            print(f"No experiment summary found for {exp_name}, cannot pick a noise chunk.")
+        return None
+
+    noise_protocol_name = get_noise_name_by_exp(exp_name)
+    noise_rows = df_exp_summary.query("protocol_name == @noise_protocol_name").copy()
+
+    if len(noise_rows) == 0:
+        if verbose:
+            print(
+                f'No "{noise_protocol_name}" runs found at all for {exp_name} -- '
+                "cannot pick a noise chunk."
+            )
+        return None
+
+    noise_rows["_resolved_id"] = noise_rows.apply(
+        lambda row: row["chunk_name"]
+        if isinstance(row["chunk_name"], str) and row["chunk_name"].strip()
+        else row["datafile_name"],
+        axis=1,
+    )
+    noise_chunks = noise_rows.drop_duplicates(subset="_resolved_id").sort_values(
+        "minutes_since_start"
+    )
+
+    for i_pref, ndf_target in enumerate(preferred_ndfs):
+        ndf_chunks = noise_chunks[noise_chunks["NDF"] == ndf_target]
+
+        if len(ndf_chunks) == 0:
+            if verbose:
+                print(f"{exp_name}: no white-noise chunk found at NDF {ndf_target}.")
+            continue
+
+        classified = []
+        for _, row in ndf_chunks.iterrows():
+            chunk_name = row["_resolved_id"]
+            data_path = _resolve_vision_data_path(exp_name, chunk_name, ss_version)
+            try:
+                classification_files = [
+                    f for f in os.listdir(data_path) if "classification" in f.lower()
+                ]
+            except Exception as e:
+                if verbose:
+                    print(f"  Could not list files for {chunk_name} ({data_path}): {e}")
+                classification_files = []
+
+            if classification_files:
+                classified.append((chunk_name, row["block_id"], classification_files))
+
+        if not classified:
+            if verbose:
+                print(
+                    f"{exp_name}: NDF {ndf_target} has {len(ndf_chunks)} white-noise "
+                    f"chunk(s) ({list(ndf_chunks['_resolved_id'])}), but none have a "
+                    "classification file."
+                )
+            continue
+
+        if i_pref > 0 and verbose:
+            print(
+                f"{exp_name}: NDF {preferred_ndfs[0]} had no classified chunk, "
+                f"falling back to NDF {ndf_target}."
+            )
+
+        chosen_chunk_name, chosen_block_id, chosen_files = classified[0]
+
+        if verbose:
+            if len(classified) > 1:
+                print(
+                    f"{exp_name}: {len(classified)} classified chunks found at NDF "
+                    f"{ndf_target}: {[c[0] for c in classified]}. Using the earliest, "
+                    f"{chosen_chunk_name} (classification file(s): {chosen_files}). "
+                    "Pass a different chunk name as analysis_chunk_name= to "
+                    "create_mea_pipeline if you want a different one."
+                )
+            else:
+                print(
+                    f"{exp_name}: using {chosen_chunk_name} (NDF {ndf_target}, "
+                    f"classification file(s): {chosen_files})."
+                )
+
+            try:
+                ep_q = schema.Epoch() & f"parent_id={chosen_block_id}"
+                ep_id = ep_q.to_arrays("id")[0]
+                params = (schema.Epoch() & f"id={ep_id}").fetch1("parameters")
+                print(f"  Stimulus parameters for {chosen_chunk_name}:")
+                for k in sorted(params.keys()):
+                    print(f"    {k}: {params[k]}")
+            except Exception as e:
+                print(f"  Could not fetch stimulus parameters for {chosen_chunk_name}: {e}")
+
+        return chosen_chunk_name
+
+    if verbose:
+        print(
+            f"{exp_name}: no classified white-noise chunk found at any of "
+            f"NDF {list(preferred_ndfs)}. Returning None -- create_mea_pipeline will "
+            "fall back to its own nearest-chunk logic unless you pass "
+            "analysis_chunk_name explicitly."
+        )
+    return None
+
+
 def get_n_cells_of_interest(
     str_file: str, ls_cell_types: list = ["OffP", "OffM", "OnP", "OnM"]
 ):
@@ -680,6 +1119,18 @@ def get_display_params_by_exp(exp_name: str, verbose: bool = True):
         n_ht = 1140
         n_wt = 1824
         mean_frame_rate = 59.9422
+
+    # Rig A (Greg, added by Yasmine 07/08/2026)
+    elif "A" in exp_name:
+        if verbose:
+            print(
+                f"For Rig E {exp_name}, assuming ConfocalWithLightCrafterAbove rig config:"
+            )
+        disp_type = "LCR"
+        mu_per_pixel = 7.6
+        n_ht = 912
+        n_wt = 1140
+        mean_frame_rate = 59.941548817817917
     else:
         raise ValueError(
             f"Unexpected Rig identified in MEA experiment name {exp_name} !"

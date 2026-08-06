@@ -544,20 +544,25 @@ class MEAResponseBlock(ResponseBlock):
         d_result = dict()
         with open(file_path, "r") as file:
             for line in file:
-                # Split each line into key and value using the specified delimiter
-                key, value = map(str.strip, line.split(" ", 1))
-                sub_values = value.split("/")
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                key, value = map(str.strip, parts)
+                sub_values = [part.strip() for part in value.split("/") if part.strip()]
 
-                # Add key-value pair to the dictionary
                 if int(key) in self.match_dict.keys():
-                    d_result[self.match_dict[int(key)]] = sub_values[:-1]
+                    d_result[self.match_dict[int(key)]] = sub_values
 
         for idx, id in enumerate(self.cell_ids):
             if id in d_result.keys():
+                matched_type = "Unknown"
                 for ctype in cell_types:
                     if ctype in d_result[id]:
-                        d_result[id] = ctype
+                        matched_type = ctype
                         break
+                d_result[id] = matched_type
             else:
                 d_result[id] = "Unknown"
 
@@ -925,20 +930,25 @@ class MEAResponseGroup:
         d_result = dict()
         with open(file_path, "r") as file:
             for line in file:
-                # Split each line into key and value using the specified delimiter
-                key, value = map(str.strip, line.split(" ", 1))
-                sub_values = value.split("/")
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                key, value = map(str.strip, parts)
+                sub_values = [part.strip() for part in value.split("/") if part.strip()]
 
-                # Add key-value pair to the dictionary
                 if int(key) in self.match_dict.keys():
-                    d_result[self.match_dict[int(key)]] = sub_values[:-1]
+                    d_result[self.match_dict[int(key)]] = sub_values
 
         for idx, id in enumerate(self.cell_ids):
             if id in d_result.keys():
+                matched_type = "Unknown"
                 for ctype in cell_types:
                     if ctype in d_result[id]:
-                        d_result[id] = ctype
+                        matched_type = ctype
                         break
+                d_result[id] = matched_type
             else:
                 d_result[id] = "Unknown"
 

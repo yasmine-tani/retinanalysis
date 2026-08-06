@@ -33,31 +33,6 @@ from .utils.datajoint_utils import *
 from .utils import ei_utils
 from .utils.ei_utils import *
 
-# NEW 2026-07-28 (Claude, per yas): F1/F0, DSI/OSI, and Naka-Rushton fitting for
-# grating-based protocols (direction/orientation selectivity, contrast response).
-# Doesn't reference any classes, so safe to import here alongside the other utils.
-from .utils import tuning
-from .utils.tuning import *
-
-# NEW 2026-07-29 (Claude, per yas): spike-train cross-correlation analysis (compute_ccf,
-# build_master_mapping_table) for correlated-spiking analysis across NDF light levels.
-# Only imports datajoint_utils at module level; AnalysisChunk/MEAResponseBlock/cluster_match
-# are imported lazily inside functions to avoid circular imports (same pattern already used
-# in vision_utils.py and datajoint_utils.py's plot_mosaics_for_datasets).
-from .utils import correlation_utils
-from .utils.correlation_utils import *
-
-# NEW 2026-08-03 (Claude, per yas -- "why cant we just save a file with just my defitions
-# thats ouside the notebook"): the contrast-response demo's shared load/plot functions
-# (load_contrast_section, plot_crf_across_ndfs, plot_crf, plot_raster_overview_by_cell_type,
-# plot_rasters_for_cell_type, _raster_for_cell), moved here from a single large notebook cell
-# in demos/7_contrast_response_demo.ipynb. Only imports numpy/pandas/matplotlib at module
-# level; `import retinanalysis as ra` is done lazily inside the two functions that need it
-# (load_contrast_section, plot_crf_across_ndfs), same circular-import-avoidance pattern as
-# correlation_utils.py/datajoint_utils.py.
-from .utils import contrast_response_utils
-from .utils.contrast_response_utils import *
-
 from .utils import spike_detector
 
 from .utils import regen

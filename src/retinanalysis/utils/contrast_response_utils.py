@@ -270,7 +270,8 @@ def load_contrast_section(exp_name, contrast_search, protocol_name, condition_ke
 
 def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key,
                           analysis_chunk_name, corr_cutoff, response_col, title_prefix,
-                          typing_chunk=None, log_x=None, cell_types=None, show_sem=True):
+                          typing_chunk=None, log_x=None, cell_types=None, show_sem=True,
+                          even_spacing=False):
     """Loops every NDF found for `protocol_name` (via `ra.get_ndf_blocks_for_protocol`, real
     database NDF values, not a hardcoded list) and calls load_contrast_section once per NDF
     -- the same function used by the single-NDF CRF cell and the NDF explorer cells.
@@ -285,6 +286,12 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
     show_sem (default True): whether to draw SEM error bars on each NDF's line. With many
     NDFs overlaid on the same axes the error bars can make the plot busy -- set to False for
     just the mean lines/markers.
+
+    even_spacing (bool): NEW 2026-08-06 (Claude, per yas) -- see plot_crf's docstring for
+    the full reasoning. Only used when log_x is False: places each tested condition value
+    at an evenly-spaced position (not its true numeric position) with the real value as
+    the tick label, so geometrically/log-spaced condition levels (e.g. contrast) don't
+    visually pile up near zero on a true linear axis. Default False.
 
     Returns a dict of {cell_type: fig}.
 
@@ -326,6 +333,17 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
         print('No NDF had usable data -- nothing plotted.')
         return {}
 
+    # Stable value -> rank mapping for even_spacing mode, built ONCE from every
+    # condition value seen across every loaded NDF (condition levels are a stimulus
+    # property, not cell-type-dependent), so every figure/NDF/panel places the same
+    # value at the same x position.
+    value_to_rank = None
+    if even_spacing and not log_x:
+        all_values = set()
+        for df in df_trials_by_ndf.values():
+            all_values.update(df[condition_key].dropna().unique().astype(float).tolist())
+        value_to_rank = {v: i for i, v in enumerate(sorted(all_values))}
+
     if cell_types is None:
         all_types = set()
         for df in df_trials_by_ndf.values():
@@ -360,10 +378,12 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
             pop = curves.groupby(condition_key)[response_col].agg(['mean', 'sem']).reset_index()
             x = pop[condition_key].values.astype(float)
             all_x_values.update(x.tolist())
-            x_plot = (
-                np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
-                if log_x else x
-            )
+            if log_x:
+                x_plot = np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
+            elif value_to_rank is not None:
+                x_plot = np.array([value_to_rank[v] for v in x])
+            else:
+                x_plot = x
             color = colors[ndf_val]
             axes[0].errorbar(x_plot, pop['mean'], yerr=(pop['sem'] if show_sem else None),
                               marker='o', capsize=3, color=color, label=f'NDF {ndf_val:g}')
@@ -400,6 +420,11 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
             ax.grid(True, alpha=0.3)
             if log_x:
                 ax.set_xscale('log')
+            elif value_to_rank is not None:
+                # even_spacing: evenly-spaced rank positions, real values as labels --
+                # see plot_crf's even_spacing docstring for the full reasoning.
+                ax.set_xticks(list(value_to_rank.values()))
+                ax.set_xticklabels([f'{v:g}' for v in value_to_rank.keys()])
             else:
                 # Same "clear 0-1 contrast ticks" convention as plot_crf: tick every
                 # real tested value, fix the axis to the full [0, 1] span specifically
@@ -416,16 +441,38 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
     return figs
 
 
-def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, log_x=None, show_noise_sub=True):
+def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, log_x=None,
+             show_noise_sub=True, even_spacing=False):
     """Raw response (row 1) vs. noise-subtracted response (row 2, only if
     show_noise_sub=True) x non-normalized vs. per-cell-normalized (each cell's own max
     set to 1) columns. Population mean +/- SEM across cells at each condition level.
 
     show_noise_sub (bool): set False when response_col's noise-subtracted version isn't
     reliable (e.g. grating F1 -- see the CAVEAT in build_trial_response_table's docstring
-    about noise_f1's short-window statistical bias). Default True."""
+    about noise_f1's short-window statistical bias). Default True.
+
+    even_spacing (bool): NEW 2026-08-06 (Claude, per yas). Only used when log_x is
+    False. Tested condition values (e.g. contrast levels) are often geometrically/
+    log-spaced in practice (e.g. 0.02, 0.05, 0.1, 0.2, 0.4, 0.8) -- on a true linear
+    axis, that packs every low value visually on top of each other near zero: yas,
+    after switching these plots from log to linear per her own earlier request, "all
+    the lower level contrasts are on top of each other." even_spacing=True keeps a
+    LINEAR-looking axis (no log-scale, no scientific notation) but places each tested
+    value at an evenly-spaced integer position instead of its true numeric position,
+    labeling each tick with the real value -- so every condition gets equal visual
+    separation regardless of how close its real numeric neighbors are, while you still
+    read the actual tested numbers off the ticks. Default False (true-to-scale linear
+    spacing, matching the existing non-log behavior)."""
     if log_x is None:
         log_x = (condition_key == 'contrast')
+
+    # Stable value -> rank position mapping for even_spacing mode, built from every
+    # condition value present in df_trials (not just one panel's subset), so every
+    # panel in this figure places the same value at the same x position.
+    value_to_rank = None
+    if even_spacing and not log_x:
+        all_values = sorted(df_trials[condition_key].dropna().unique().astype(float).tolist())
+        value_to_rank = {v: i for i, v in enumerate(all_values)}
 
     nrows = 2 if show_noise_sub else 1
     fig, axes = plt.subplots(nrows, 2, figsize=(11, 4.5 * nrows), squeeze=False)
@@ -472,6 +519,12 @@ def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, lo
         if log_x:
             x_plot = np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
             ax.set_xscale('log')
+        elif value_to_rank is not None:
+            # even_spacing: plot at evenly-spaced rank positions, but label each tick
+            # with the real tested value -- see even_spacing's docstring above.
+            x_plot = np.array([value_to_rank[v] for v in x])
+            ax.set_xticks(list(value_to_rank.values()))
+            ax.set_xticklabels([f'{v:g}' for v in value_to_rank.keys()])
         else:
             x_plot = x
             # UPDATED 2026-08-06 (Claude, per yas): "clear 0-1 contrast ticks instead"

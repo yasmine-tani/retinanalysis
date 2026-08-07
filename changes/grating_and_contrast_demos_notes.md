@@ -1725,3 +1725,119 @@ histogram anymore.
   path wasn't broken by this change.
 - Not yet re-verified against yas's live database -- needs a kernel restart and
   re-running the notebook.
+
+## Update 2026-08-06 (later, later): revert Naka-Rushton plot to linear
+
+**Why:** yas ran the log-scale-with-real-labels version of the Naka-Rushton cell from
+the update below and said it "looks weird... make that one go back to what it was."
+Reverted cell `4851bf19` back to the plain linear axis (real tested contrasts ticked,
+`ax.set_xlim(0, 1)`, `c_smooth = np.linspace(0, max, 200)`) -- i.e. undid only the
+log-scale/`geomspace` change from the entry below, keeping the earlier C50-histogram
+removal (that part was never in question). The parallel log-scale CRF cells
+(`plot_crf`/`plot_crf_across_ndfs` calls with `log_x=True`) added in the same update
+are untouched -- this revert is scoped to the Naka-Rushton fit cell only.
+
+### Verification
+- `nbformat.validate()` + `compile()` on all 27 code cells -- passes.
+- Not yet re-verified against yas's live database.
+
+## Update 2026-08-06 (later x2): revert Naka-Rushton plot all the way to original
+
+**Why:** the previous revert (plain linear axis, but still forcing an explicit tick at
+every real tested contrast value) still wasn't right -- yas: "now the naka rushton has
+contrast conditions on top of each other go back to the very first naka rushton curve
+ou made." On this plot's narrow single-axis width (5.5in figure), forcing 6-8 explicit
+ticks (several closely-spaced low contrasts among them) crowded/overlapped the tick
+labels themselves. Reverted cell `4851bf19`'s axis all the way to the very original
+style from before any of today's axis changes: no `ax.set_xticks(...)`, no
+`ax.set_xlim(...)` at all -- just matplotlib's own default linear tick locator, which
+picks a small number of well-spaced round-number ticks rather than one per real value.
+The C50-histogram removal is NOT reversed (that was a separate, standing request from
+earlier in the day, unrelated to this axis back-and-forth). The CRF plots'
+`even_spacing`/log-scale-pair changes from the entry below are untouched -- this is
+scoped to the Naka-Rushton cell only, which never got `even_spacing` treatment in the
+first place (continuous fitted curve, no natural categorical-axis position).
+
+### Verification
+- `nbformat.validate()` + `compile()` on all 27 code cells -- passes.
+- Not yet re-verified against yas's live database.
+
+## Update 2026-08-06 (later): even-spaced linear axis + parallel log-scale cells
+
+**Why:** immediately after the previous update, yas ran the notebook and reported "all
+the lower level contrasts are on top of each other" -- the [0, 1] linear axis from the
+update above is accurate, but tested contrasts are typically geometrically/log-spaced
+in practice (e.g. 0.02, 0.05, 0.1, 0.2, 0.4, 0.8), so on a true linear scale the low
+values end up numerically close together and visually overlap. This is exactly the
+problem log-scale originally existed to solve. After some back-and-forth, yas's final
+ask: keep BOTH a log-scale cell (scientific notation is fine there, per her) and a
+linear-scale cell for every contrast plot, but make the linear one actually usable by
+spacing points out rather than plotting them at their true (clustering) positions.
+
+**`contrast_response_utils.py`:**
+- `plot_crf(..., even_spacing=False)` and `plot_crf_across_ndfs(..., even_spacing=False)`
+  -- new parameter on both, only relevant when `log_x` is False. When True, every
+  tested condition value is placed at an evenly-spaced integer rank position instead
+  of its true numeric position (`value_to_rank = {value: i for i, value in
+  enumerate(sorted(unique_values))}`), with the real value as that tick's label
+  (`f'{v:g}'`). The axis still looks/behaves like a plain linear axis (no log scale,
+  no scientific notation) -- only the spacing between tested values is equalized, not
+  their displayed labels. `plot_crf` builds this mapping from every value in the input
+  `df_trials`; `plot_crf_across_ndfs` builds it once from the union of every NDF's
+  values (before the per-cell-type plotting loop), so every figure/NDF/panel places a
+  given value at the same position. Default `False` preserves the prior "clear 0-1
+  contrast ticks" behavior (true-to-scale spacing, fixed [0,1] xlim for
+  `condition_key == 'contrast'`) added in the update above -- unaffected unless
+  `even_spacing=True` is explicitly passed.
+
+**`demos/7_contrast_response_demo.ipynb`:** every contrast-plotting cell now has TWO
+versions back to back -- unchanged from the previous update, then a new duplicate cell
+right after it:
+- Cell `3853ba05` (grating CRF, linear/even-spaced) + new cell after it (log-scale,
+  `log_x=True`, unchanged scientific-notation default).
+- Cell `crfallndf2` (grating CRF across NDFs, linear/even-spaced) + new cell after it
+  (log-scale).
+- Cell `763f6870` (flash CRF, linear/even-spaced) + new cell after it (log-scale).
+- Cell `549ff346` (spot CRF, linear/even-spaced) + new cell after it (log-scale).
+- The four linear-version cells above also gained `even_spacing=True` (previously just
+  `log_x=False`).
+- Cell `4851bf19` (Naka-Rushton fit) -- NOT given an even-spaced linear version. This
+  plot draws a continuous fitted curve alongside the data points, and an evenly-spaced
+  categorical axis has no natural position for a continuous curve between ticks (the
+  curve would have to be broken into disconnected data-point-to-data-point segments,
+  losing the actual fitted shape). Kept log-scale instead (already the literature
+  convention for these curves), but with explicit real-value tick labels
+  (`ax.set_xticklabels([f'{c:g}' for c in tested_contrasts])`) instead of matplotlib's
+  default scientific/power-of-ten log formatting, so the numbers are still directly
+  readable -- this was yas's original ask ("i just want to be able to actually see the
+  numbers in the log scale"). `contrast=0` is plotted at half the smallest nonzero
+  tested contrast (log(0) is undefined, same floor-value convention `plot_crf`'s
+  `log_x=True` branch already used) but its tick is still LABELED `'0'`, its real
+  value. The smooth fitted curve (`c_smooth`) switched from `np.linspace(0, max, 200)`
+  to `np.geomspace(c_floor, max, 200)` so every point on the curve has a strictly
+  positive x value (a curve including x=0 or evenly-spaced-through-zero values would
+  break/distort on a log axis).
+
+### Verification
+- `python -m py_compile` on `contrast_response_utils.py` -- passes.
+- `nbformat.validate()` + `compile()` on all 27 code cells (45 total cells, up from 41
+  before the 4 new log-scale cells) -- passes.
+- Synthetic test against the real `plot_crf` (loaded via `importlib`): 5 cells x 8
+  geometrically-spaced contrasts (0.0, 0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 0.96) x 3
+  trials. With `even_spacing=True`: confirmed linear xscale, confirmed tick positions
+  are evenly spaced (diff of exactly 1.0 between consecutive ticks) despite the real
+  values not being evenly spaced, confirmed every real tested value appears as a tick
+  label, confirmed the actually-plotted line data itself uses the evenly-spaced rank
+  positions (not the true, clustering values). With `even_spacing=False`: confirmed
+  the prior true-linear/[0,1]-xlim behavior is unchanged. Confirmed
+  `plot_crf_across_ndfs` has the new `even_spacing` parameter with the right default.
+- Naka-Rushton cell verified by extracting the LITERAL cell source from the saved
+  `.ipynb` (via `json.load`, not reimplemented) and `exec()`-ing it against 8 synthetic
+  cells with known ground-truth C50/n shapes plus noise, with `retinanalysis.utils.tuning`
+  stubbed in `sys.modules` to point at the real `tuning.py` module (avoids needing the
+  full config/DB-backed package init). Confirmed: log xscale; every real tested
+  contrast (0.0 through 0.96) appears as a tick label; contrast=0 is plotted at a
+  strictly positive x position (log-safe) while still labeled `'0'`; the smooth fitted
+  curve's 200 points are all strictly positive (won't break/distort on the log axis).
+- Not yet re-verified against yas's live database -- needs a kernel restart and
+  re-running the notebook.

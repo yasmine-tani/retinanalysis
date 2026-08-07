@@ -341,6 +341,11 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
         fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
         fig.suptitle(f'{title_prefix} -- {ct}', fontsize=14)
         any_plotted = False
+        # UPDATED 2026-08-06 (Claude, per yas): collected across every NDF plotted on
+        # these shared axes, so the tick-setting below (non-log_x case) reflects every
+        # real tested condition value seen, not just whichever NDF happened to be
+        # plotted last.
+        all_x_values = set()
 
         for ndf_val in ndf_vals:
             ct_trials = df_trials_by_ndf[ndf_val]
@@ -354,6 +359,7 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
 
             pop = curves.groupby(condition_key)[response_col].agg(['mean', 'sem']).reset_index()
             x = pop[condition_key].values.astype(float)
+            all_x_values.update(x.tolist())
             x_plot = (
                 np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
                 if log_x else x
@@ -394,6 +400,15 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
             ax.grid(True, alpha=0.3)
             if log_x:
                 ax.set_xscale('log')
+            else:
+                # Same "clear 0-1 contrast ticks" convention as plot_crf: tick every
+                # real tested value, fix the axis to the full [0, 1] span specifically
+                # for condition_key == 'contrast' (a value that's conceptually bounded
+                # there), rather than trusting matplotlib's default linear locator.
+                if all_x_values:
+                    ax.set_xticks(sorted(all_x_values))
+                if condition_key == 'contrast':
+                    ax.set_xlim(0, 1)
             ax.legend(fontsize=8)
         fig.tight_layout()
         figs[ct] = fig
@@ -459,6 +474,18 @@ def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, lo
             ax.set_xscale('log')
         else:
             x_plot = x
+            # UPDATED 2026-08-06 (Claude, per yas): "clear 0-1 contrast ticks instead"
+            # -- log_x=False previously just fell back to matplotlib's default linear
+            # tick placement, which is fine but doesn't guarantee a tick at every real
+            # tested contrast level. Explicitly tick every actual value present in the
+            # data instead, so the axis reads the real tested contrasts rather than an
+            # arbitrary round-number grid. For condition_key == 'contrast' specifically
+            # (a value that's conceptually bounded in [0, 1]), also fix the axis range
+            # to the full [0, 1] span rather than autoscaling tightly to whatever the
+            # max tested contrast happened to be.
+            ax.set_xticks(sorted(set(x)))
+            if condition_key == 'contrast':
+                ax.set_xlim(0, 1)
         ax.errorbar(x_plot, pop['mean'], yerr=pop['sem'], marker='o', capsize=3)
         ax.set_xlabel(_condition_axis_label(condition_key))
         ax.set_ylabel(_response_axis_label(col))

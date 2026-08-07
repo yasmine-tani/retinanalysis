@@ -1655,3 +1655,73 @@ time -- pagination keeps each page a normal size.
   returns `[]` without erroring.
 - Not yet re-verified against yas's live database -- package-level change, needs a
   kernel restart plus re-running the notebook from the grating load cell down.
+
+## Update 2026-08-06: linear 0-1 contrast ticks, dropped the C50 histogram
+
+**Why:** yas asked what the Naka-Rushton fit plot actually adds over the raw F1 curves
+(answer: it's a fitted 4-parameter model summarizing the F1-vs-contrast data, not
+another view of the same measurement), then said she didn't want the population C50
+histogram next to it ("i dont want that bar plot... idk what purpose it serves"), and
+separately asked why the contrast axis on the CRF plots showed scientific notation
+("is it because its log scale"). It is: `plot_crf`/`plot_crf_across_ndfs` both default
+to `log_x = (condition_key == 'contrast')`, so every contrast plot in this demo was
+log-scaled by default, which is where the power-of-ten tick labels came from. She asked
+for plain linear 0-1 axes with real contrast values ticked, for every contrast plot in
+this demo, plus removal of the C50 histogram.
+
+Separately worth noting (from the earlier "what's the point of the histogram"
+conversation): the C50 histogram wasn't just uninteresting, it was actively misleading.
+`fit_naka_rushton`'s `c50` upper bound is unconstrained (`np.inf`) -- any cell whose F1
+doesn't clearly saturate within the tested contrast range is mathematically ambiguous
+for this model and can fit to an arbitrarily large c50, which stretches the
+histogram's x-axis and squashes every well-behaved cell into a single low bin (the
+"always just one huge bar" yas described). Not fixed here since she asked to just
+remove the plot rather than fix the fit's bounds -- `df_fits_grating` (every cell's
+fitted c50/r_squared, printed as a table) is still available if anyone wants to look
+at the population numbers directly, that underlying issue just isn't visualized as a
+histogram anymore.
+
+**`contrast_response_utils.py`:**
+- `plot_crf`: in the `else` branch (non-log_x case), now sets `ax.set_xticks(sorted(set(x)))`
+  -- every actual tested condition value gets a tick, not just whatever matplotlib's
+  default linear locator would have chosen. Additionally, when `condition_key ==
+  'contrast'` specifically, `ax.set_xlim(0, 1)` fixes the axis to the full conceptual
+  [0, 1] range rather than autoscaling tightly to the max tested contrast. No change to
+  the `log_x=True` branch -- log-scale plots (still available via an explicit
+  `log_x=True` call) behave exactly as before.
+- `plot_crf_across_ndfs`: same tick/xlim convention, applied once (after the per-NDF
+  loop) using the union of every real value seen across all NDFs plotted on those
+  shared axes (`all_x_values`), so ticks reflect every NDF's tested contrasts, not just
+  whichever NDF happened to be plotted last.
+- Neither function's `log_x` *default* changed (`log_x=None` still means "log-scale iff
+  condition_key == 'contrast'") -- this only changes what happens when `log_x=False` is
+  passed explicitly, so other notebooks/callers relying on the log default are
+  unaffected. Demo 7's own cells now pass `log_x=False` explicitly (see below) rather
+  than the shared default being flipped for everyone.
+
+**`demos/7_contrast_response_demo.ipynb`:**
+- Cell `3853ba05` (grating CRF), `crfallndf2` (grating CRF across NDFs), `763f6870`
+  (flash CRF), `549ff346` (spot CRF) -- added `log_x=False` to each `plot_crf`/
+  `plot_crf_across_ndfs` call.
+- Cell `4851bf19` (Naka-Rushton fit) -- dropped the `axes[1].hist(df_fits_grating['c50'], ...)`
+  population histogram and the `plt.subplots(1, 2, ...)` layout it needed; now a single
+  axis with just the example cell's data + fitted curve, with `ax.set_xticks(...)` at
+  the real tested contrasts and `ax.set_xlim(0, 1)`, same convention as the CRF cells.
+  `df_fits_grating` (the full per-cell fit table) is still computed and displayed above
+  the plot exactly as before -- only the histogram figure itself was removed.
+- Cell `e8f8f82b` (markdown, section intro) -- rewritten to describe the single-plot
+  output and explain why the histogram was dropped.
+
+### Verification
+- `python -m py_compile` on `contrast_response_utils.py` -- passes.
+- `nbformat.validate()` + `compile()` on every one of the notebook's 23 code cells --
+  passes.
+- Synthetic test against the real `plot_crf` (loaded via `importlib`, not
+  reimplemented): 5 synthetic cells x 5 non-round tested contrasts (0.0, 0.12, 0.35,
+  0.6, 0.96) x 3 trials. With `log_x=False`: confirmed `ax.get_xscale() == 'linear'`,
+  confirmed `ax.get_xlim()` covers `[0, 1]`, confirmed every one of the 5 real tested
+  contrast values is an actual tick (not just round numbers). With `log_x=True`:
+  confirmed `ax.get_xscale() == 'log'` still works unchanged, confirming the log-scale
+  path wasn't broken by this change.
+- Not yet re-verified against yas's live database -- needs a kernel restart and
+  re-running the notebook.

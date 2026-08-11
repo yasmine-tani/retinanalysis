@@ -110,6 +110,8 @@ def build_trial_response_table(
     protocol_name: str,
     condition_keys: List[str],
     stim_freq_key: str = "temporalFrequency",
+    baseline_condition_key: Optional[str] = None,
+    baseline_condition_value: float = 0.0,
 ) -> "pd.DataFrame":
     """
     NEW 2026-07-29 (Claude, per yas): tidy per-(cell, trial) response table for a
@@ -121,26 +123,38 @@ def build_trial_response_table(
 
     For every epoch matching protocol_name, and every cell in response_block:
       - mean_rate (Hz): spike count in the stimulus window (stimTime) / stimTime.
-      - baseline_rate (Hz): spike count in a window taken from the END of the
-        pre-stimulus period (immediately before stimulus onset), of length
-        min(preTime, stimTime), divided by that window's duration -- this is
-        yas's chosen noise-subtraction convention (spontaneous rate from the
-        pre-stimulus window), applied per-trial, per-cell. If preTime is 0, this
-        (and everything derived from it) is 0.
+      - baseline_rate (Hz): the noise-subtraction baseline. Two mutually exclusive
+        conventions, selected by baseline_condition_key (see UPDATED 2026-08-10
+        below):
+          - baseline_condition_key=None (default): spike count in a window taken
+            from the END of the pre-stimulus period (immediately before stimulus
+            onset), of length min(preTime, stimTime), divided by that window's
+            duration -- yas's ORIGINAL noise-subtraction convention (spontaneous
+            rate from the pre-stimulus window), applied per-trial, per-cell. If
+            preTime is 0, this (and everything derived from it) is 0.
+          - baseline_condition_key='contrast' (or whatever condition_keys entry
+            is meaningful for the protocol): per-cell average STIMULUS-window
+            mean_rate across every trial where that condition equals
+            baseline_condition_value (default 0.0), applied to every row for
+            that cell regardless of that row's own condition value. See UPDATED
+            2026-08-10 below for why.
       - mean_rate_noise_sub (Hz): mean_rate - baseline_rate. Can be negative (a
         trial with less activity than its own baseline estimate) -- left
         un-clipped so it stays usable for averaging/statistics downstream.
       - f0, f1, noise_f1, f1_noise_sub (Hz): only computed when epoch_parameters
         has a stim_freq_key entry that isn't None/0 for that epoch, i.e. only for
         periodic stimuli. f1 is computed via compute_f1_f0_from_spikes on the
-        stimulus-window spikes; noise_f1 the same way on the same pre-stimulus
-        baseline window used for baseline_rate, at the same frequency; f1_noise_sub
-        = f1 - noise_f1. For non-periodic epochs, all four of these columns are
-        NaN for that row (mean_rate-based columns are always computed regardless).
+        stimulus-window spikes; noise_f1 follows the same baseline_condition_key
+        convention as baseline_rate above (pre-stimulus window F1 by default, or
+        per-cell average stimulus-window F1 at the baseline condition when
+        baseline_condition_key is given); f1_noise_sub = f1 - noise_f1. For
+        non-periodic epochs, all four of these columns are NaN for that row
+        (mean_rate-based columns are always computed regardless).
 
         CAVEAT added 2026-07-30 (Claude, per yas -- grating CRF/rasters "looked
-        off"): noise_f1/f1_noise_sub have a real statistical bias and should NOT
-        be treated as the default/primary CRF measure. compute_f1_f0_from_spikes's
+        off"): with the DEFAULT (baseline_condition_key=None) pre-stimulus-window
+        convention, noise_f1/f1_noise_sub have a real statistical bias and should
+        NOT be treated as the default/primary CRF measure. compute_f1_f0_from_spikes's
         vector-sum F1 estimate has a noise floor that scales like ~1/sqrt(window
         duration) -- confirmed numerically (synthetic pure-Poisson, non-modulated
         spiking at a fixed rate: mean apparent F1 over a 0.25s window came out
@@ -159,13 +173,27 @@ def build_trial_response_table(
         mis-behaved for short preTime windows. mean_rate_noise_sub does NOT have
         this problem (a plain spike-count/duration rate estimate isn't biased by
         short windows the way a short-window Fourier vector-sum is), so that
-        stays fine to use for spot/flash. The f0/f1/noise_f1/f1_noise_sub columns
-        are still computed and left in the output (useful for inspection / a
-        future debiased version), but demos/7_contrast_response_demo.ipynb's
-        grating section now defaults to plotting raw 'f1', not 'f1_noise_sub',
-        matching yas's own scripts. Revisit noise_f1's estimator (e.g. only
-        computing it when the noise window spans enough stim_freq cycles to be
-        meaningful) if a baseline-subtracted F1 measure turns out to be needed.
+        stays fine to use for spot/flash. demos/*_demo.ipynb's grating section
+        defaults to plotting raw 'f1', not 'f1_noise_sub', matching yas's own
+        scripts, for this reason.
+
+        UPDATED 2026-08-10 (Claude, per yas, item 3a of a post-meeting list):
+        baseline_condition_key adds a second convention that sidesteps the
+        short-window bias above entirely, rather than trying to debias the old
+        one. yas: use the 0%-contrast run's own STIMULUS-window response as the
+        baseline instead of each trial's pre-stimulus window, "since the 0% run
+        has the same duration as other conditions." That's the key property that
+        fixes the CAVEAT above: noise_f1 (and baseline_rate) are now computed
+        over a window the same length as stim_time_s, not min(preTime,
+        stim_time_s), so there's no short-window inflation. It also matches what
+        "baseline" conceptually means for a contrast-response experiment better
+        than an inter-trial pre-stimulus period does: the response to literally
+        no contrast modulation, measured the same way (same window, same
+        analysis) as every other condition, rather than a gray/blank period
+        between trials that may not even share the same adaptation state.
+        Opt-in (baseline_condition_key=None keeps the original pre-stimulus
+        convention) since this function is also usable for protocols where a
+        "zero" condition value has no such special meaning.
       - condition_keys columns: whatever epoch_parameters keys you ask for (e.g.
         ['contrast']), pulled directly with no assumption about which keys exist
         for which protocol -- this is why protocol_name/condition_keys/
@@ -196,10 +224,30 @@ def build_trial_response_table(
     'temporalFrequency'. If this key is absent, None, or 0 for an epoch, that
     epoch's f0/f1/noise_f1/f1_noise_sub come out as NaN.
 
+    baseline_condition_key (Optional[str]): NEW 2026-08-10. If given (must be one
+    of condition_keys -- raises ValueError otherwise), baseline_rate/noise_f1 are
+    computed from the per-cell average stimulus-window response at
+    baseline_condition_value of THIS condition (see UPDATED 2026-08-10 above),
+    instead of each trial's own pre-stimulus window. Default None (original
+    pre-stimulus-window behavior, unchanged).
+
+    baseline_condition_value (float): which value of baseline_condition_key counts
+    as the baseline condition (e.g. 0.0 for "0% contrast"). Only used when
+    baseline_condition_key is given. Default 0.0.
+
     Returns:
     df_trials (pandas DataFrame): one row per (cell, epoch) matching
-    protocol_name, with the columns described above.
+    protocol_name, with the columns described above. If baseline_condition_key is
+    given and some cell has zero trials at baseline_condition_value, that cell's
+    baseline_rate/noise_f1/mean_rate_noise_sub/f1_noise_sub come out as NaN for
+    every one of its rows (not silently falling back to the pre-stimulus
+    convention) -- a warning listing affected cell_ids is printed.
     """
+    if baseline_condition_key is not None and baseline_condition_key not in condition_keys:
+        raise ValueError(
+            f"baseline_condition_key={baseline_condition_key!r} must be one of "
+            f"condition_keys={condition_keys!r}."
+        )
     spike_times_by_cell = response_block.df_spike_times.set_index("cell_id")["spike_times"]
     cell_ids = response_block.cell_ids
 
@@ -269,7 +317,42 @@ def build_trial_response_table(
                 row_dict[key] = params.get(key)
             rows.append(row_dict)
 
-    return pd.DataFrame(rows)
+    df_trials = pd.DataFrame(rows)
+
+    if baseline_condition_key is not None and len(df_trials) > 0:
+        # Overwrite the pre-stimulus-window baseline columns computed above with
+        # the per-cell average STIMULUS-window response at baseline_condition_value
+        # -- see UPDATED 2026-08-10 in the docstring. mean_rate/f0/f1 (the
+        # stimulus-window values, already computed per-trial above) are untouched;
+        # only baseline_rate/noise_f1/mean_rate_noise_sub/f1_noise_sub are replaced.
+        is_baseline_row = df_trials[baseline_condition_key] == baseline_condition_value
+        baseline_means = (
+            df_trials[is_baseline_row]
+            .groupby("cell_id")[["mean_rate", "f1"]]
+            .mean()
+            .rename(columns={"mean_rate": "baseline_rate", "f1": "noise_f1"})
+            .reset_index()
+        )
+
+        cells_without_baseline = sorted(set(df_trials["cell_id"]) - set(baseline_means["cell_id"]))
+        if cells_without_baseline:
+            print(
+                f"WARNING: {len(cells_without_baseline)} cell(s) had zero trials at "
+                f"{baseline_condition_key}={baseline_condition_value} -- their "
+                "baseline_rate/noise_f1/mean_rate_noise_sub/f1_noise_sub are NaN "
+                f"(not falling back to the pre-stimulus convention): {cells_without_baseline}"
+            )
+
+        df_trials = df_trials.drop(columns=["baseline_rate", "noise_f1"]).merge(
+            baseline_means, on="cell_id", how="left"
+        )
+        df_trials["mean_rate_noise_sub"] = df_trials["mean_rate"] - df_trials["baseline_rate"]
+        df_trials["f1_noise_sub"] = df_trials["f1"] - df_trials["noise_f1"]
+        # f1/noise_f1 are only meaningful for periodic epochs -- rows that were NaN
+        # for f1 (non-periodic) stay NaN for noise_f1/f1_noise_sub too, since NaN
+        # rows are excluded from the groupby().mean() above and NaN - anything = NaN.
+
+    return df_trials
 
 
 def compute_dsi_osi(

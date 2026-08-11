@@ -20,7 +20,6 @@ import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 
 # Human-readable, unit-labeled y-axis text for each response column
 # build_trial_response_table can produce. Used by plot_crf/plot_crf_across_ndfs so every
@@ -154,7 +153,8 @@ def scrollable_figure(fig, max_height_px=600, dpi=100):
 
 def load_contrast_section(exp_name, contrast_search, protocol_name, condition_keys,
                            analysis_chunk_name, corr_cutoff=0.8, stim_freq_key='temporalFrequency',
-                           manual_datafile_name=None, typing_chunk=None, default_ndf=0):
+                           manual_datafile_name=None, typing_chunk=None, default_ndf=0,
+                           baseline_condition_key=None, baseline_condition_value=0.0):
     """Finds the datafile for `protocol_name`, builds the pipeline, builds the tidy trial
     response table, and tags each row with its cell_type.
 
@@ -164,6 +164,12 @@ def load_contrast_section(exp_name, contrast_search, protocol_name, condition_ke
     (find_datafile_for_protocol) only if no datafile at default_ndf exists for this
     protocol, and prints which path was taken either way. Pass manual_datafile_name to skip
     auto-detection entirely.
+
+    baseline_condition_key/baseline_condition_value: NEW 2026-08-10 (Claude, per yas, item
+    3a). Passed straight through to ra.build_trial_response_table -- see that function's
+    docstring for the full reasoning (use the 0%-contrast run's own stimulus-window
+    response as the noise-subtraction baseline, instead of each trial's pre-stimulus
+    window). Default None keeps the original pre-stimulus-window behavior.
 
     Returns (df_trials, spike_times_by_cell, df_epochs, datafile_name, ndf_used).
     """
@@ -213,7 +219,8 @@ def load_contrast_section(exp_name, contrast_search, protocol_name, condition_ke
     print(sorted(matching.iloc[0]['epoch_parameters'].keys()))
 
     df_trials = ra.build_trial_response_table(
-        df_epochs, response_block, protocol_name, condition_keys, stim_freq_key=stim_freq_key
+        df_epochs, response_block, protocol_name, condition_keys, stim_freq_key=stim_freq_key,
+        baseline_condition_key=baseline_condition_key, baseline_condition_value=baseline_condition_value,
     )
 
     # cell_type comes from pipeline.resp.df_spike_times, which MEAPipeline computes via its
@@ -271,7 +278,7 @@ def load_contrast_section(exp_name, contrast_search, protocol_name, condition_ke
 def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key,
                           analysis_chunk_name, corr_cutoff, response_col, title_prefix,
                           typing_chunk=None, log_x=None, cell_types=None, show_sem=True,
-                          even_spacing=False):
+                          even_spacing=False, baseline_condition_key=None, baseline_condition_value=0.0):
     """Loops every NDF found for `protocol_name` (via `ra.get_ndf_blocks_for_protocol`, real
     database NDF values, not a hardcoded list) and calls load_contrast_section once per NDF
     -- the same function used by the single-NDF CRF cell and the NDF explorer cells.
@@ -292,6 +299,12 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
     at an evenly-spaced position (not its true numeric position) with the real value as
     the tick label, so geometrically/log-spaced condition levels (e.g. contrast) don't
     visually pile up near zero on a true linear axis. Default False.
+
+    baseline_condition_key/baseline_condition_value: NEW 2026-08-10 (Claude, per yas, item
+    3a). Passed straight through to load_contrast_section (and from there to
+    ra.build_trial_response_table) for every NDF loaded -- see
+    build_trial_response_table's docstring. Default None keeps the original
+    pre-stimulus-window baseline behavior.
 
     Returns a dict of {cell_type: fig}.
 
@@ -324,6 +337,8 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
                     exp_name, contrast_search, protocol_name, condition_keys=[condition_key],
                     analysis_chunk_name=analysis_chunk_name, corr_cutoff=corr_cutoff,
                     manual_datafile_name=datafile_name, typing_chunk=typing_chunk,
+                    baseline_condition_key=baseline_condition_key,
+                    baseline_condition_value=baseline_condition_value,
                 )
                 df_trials_by_ndf[ndf_val] = df_trials_ndf
             except Exception as e:
@@ -937,7 +952,7 @@ def plot_psth_mosaic_for_cell_type(df_trials, spike_times_by_cell, df_epochs, co
 
 def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs, condition_key,
                                         selected_cell_type, bin_size_ms=10.0, max_cells_per_page=4,
-                                        cmap_name='viridis', markersize=1.5):
+                                        cmap_name='viridis', markersize=1.5, band_fill=0.85):
     """
     NEW 2026-08-05 (Claude, per yas): the standard raster-above-PSTH-below QC pairing,
     for sanity-checking a CRF against the actual spikes it's summarizing -- not just a
@@ -945,11 +960,25 @@ def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs
     PSTH-only mosaic is fine for scanning many cells for outliers, but doesn't let you
     check the curve against the raw spikes it came from). Per cell: raster on top (the
     exact same block-by-condition layout _raster_for_cell() already draws, reused
-    unchanged), its derived PSTH (compute_cell_psth(), one line per condition_key value
-    e.g. contrast, colored on the same colormap/legend for every cell) directly below
-    it, sharing the same x-axis (time from stim onset) -- so the two rows are visually
-    aligned and you can eyeball whether the PSTH curve is a fair summary of the dots
-    above it.
+    unchanged), its derived PSTH (compute_cell_psth()) below it.
+
+    UPDATED 2026-08-10 (Claude, per yas, item 3b of a post-meeting list): the PSTH
+    panel is now ONE single box, the same shape/size convention as the raster above it
+    (not a grid of separate small subplot panels -- an earlier version of this fix
+    tried that and yas: "that is not right it should be like a big box basically like
+    the raster and inside are psths at all the contrast conditions"). Inside that one
+    box, every condition's PSTH trace gets its own horizontal BAND (like the raster's
+    own per-condition row-blocks -- see _raster_for_cell()), stacked in the exact same
+    order: condition_values ascending from bottom to top, identical to how
+    _raster_for_cell() assigns its trial rows. Each trace is scaled to fill
+    band_fill (default 0.85) of its band's height, using this cell's own max rate
+    across every condition as the shared scale (so band-to-band height differences
+    within one cell are real signal, not independent per-band autoscaling), and each
+    band gets its own y-tick label (e.g. "contrast=0.5") at the band's vertical
+    center -- the same labeling convention _raster_for_cell() uses (y-ticks, not a
+    legend or in-panel text). No limit on how many conditions fit -- more conditions
+    just means more (thinner) bands inside the same one box, the same way the raster
+    handles more conditions by adding more row-blocks rather than more subplots.
 
     Paginated exactly like plot_rasters_for_cell_type -- max_cells_per_page cells per
     figure (default 4), so pages stay a normal notebook-cell-output size instead of one
@@ -966,9 +995,13 @@ def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs
 
         max_cells_per_page (int): cells per figure/page. Default 4.
 
-        cmap_name (str): matplotlib colormap name for the per-condition PSTH lines.
+        cmap_name (str): matplotlib colormap name for the per-condition PSTH bands.
 
         markersize (float): raster dot size, passed through to _raster_for_cell.
+
+        band_fill (float): fraction (0-1) of each condition's band height a fully-scaled
+        trace fills, leaving a gap between bands so adjacent conditions' traces don't
+        touch. Default 0.85.
 
     Returns:
         list of figures, one per page.
@@ -978,17 +1011,18 @@ def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs
         print(f'No cells of type {selected_cell_type!r} found.')
         return []
 
+    # Ascending order -- band 0 (bottom of the box) is the lowest condition value,
+    # exactly matching _raster_for_cell()'s own row-assignment order (its loop over
+    # `for cond_val in condition_values` also goes ascending, lowest value's block
+    # ending up at the bottom of the raster).
     cond_values = sorted(df_trials[condition_key].unique())
+    n_cond = len(cond_values)
+
     cmap = plt.get_cmap(cmap_name)
     norm = (
         plt.Normalize(vmin=min(cond_values), vmax=max(cond_values))
         if len(cond_values) > 1 else None
     )
-    legend_handles = [
-        Line2D([0], [0], color=(cmap(norm(cv)) if norm is not None else cmap(0.5)),
-               label=f'{condition_key}={cv:g}')
-        for cv in cond_values
-    ]
 
     figs = []
     n_pages = int(np.ceil(len(cells) / max_cells_per_page))
@@ -1005,24 +1039,42 @@ def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs
             cell_trials = df_trials[df_trials['cell_id'] == cell_id]
             _raster_for_cell(ax_raster, cell_id, cell_trials, spike_times_by_cell, df_epochs, condition_key,
                               markersize=markersize)
+
+            # Compute every condition's PSTH once up front so all of this cell's bands
+            # can share one y-scale (this cell's own max rate across conditions).
+            psth_by_cond = {}
             for cond_val in cond_values:
                 cond_trials = cell_trials[cell_trials[condition_key] == cond_val]
-                t, rate = compute_cell_psth(cell_id, cond_trials, spike_times_by_cell, df_epochs, bin_size_ms)
-                if t is None:
-                    continue
-                color = cmap(norm(cond_val)) if norm is not None else cmap(0.5)
-                ax_psth.plot(t, rate, color=color, linewidth=1)
-            ax_psth.set_xlim(ax_raster.get_xlim())  # keep the two rows visually aligned
-            ax_psth.set_xlabel('Time from stim onset (s)')
-            if i == 0:
-                ax_psth.set_ylabel('Rate (Hz)')
-            ax_psth.grid(True, alpha=0.3)
+                psth_by_cond[cond_val] = compute_cell_psth(
+                    cell_id, cond_trials, spike_times_by_cell, df_epochs, bin_size_ms
+                )
+            rates = [rate for _, rate in psth_by_cond.values() if rate is not None and len(rate) > 0]
+            y_max = max((rate.max() for rate in rates), default=0.0)
+            y_max = y_max if y_max > 0 else 1.0
 
-        fig.legend(handles=legend_handles, loc='lower center', ncol=min(len(cond_values), 6),
-                   fontsize=8, bbox_to_anchor=(0.5, -0.02))
+            y_ticks, y_labels = [], []
+            for band_idx, cond_val in enumerate(cond_values):
+                t, rate = psth_by_cond[cond_val]
+                color = cmap(norm(cond_val)) if norm is not None else cmap(0.5)
+                band_bottom = band_idx
+                ax_psth.axhline(band_bottom, color=(0.85, 0.85, 0.85), linewidth=0.6, zorder=0)
+                if t is not None:
+                    scaled = band_bottom + (rate / y_max) * band_fill
+                    ax_psth.plot(t, scaled, color=color, linewidth=1)
+                    ax_psth.fill_between(t, band_bottom, scaled, color=color, alpha=0.25, linewidth=0)
+                y_ticks.append(band_bottom + band_fill / 2)
+                y_labels.append(f'{condition_key}={cond_val:g}')
+
+            ax_psth.set_xlim(ax_raster.get_xlim())  # keep the two rows visually aligned
+            ax_psth.set_ylim(0, n_cond)
+            ax_psth.set_yticks(y_ticks)
+            ax_psth.set_yticklabels(y_labels, fontsize=7)
+            ax_psth.set_xlabel('Time from stim onset (s)')
+            ax_psth.grid(True, axis='x', alpha=0.3)
+
         page_label = f' (page {page + 1}/{n_pages})' if n_pages > 1 else ''
         fig.suptitle(f'{selected_cell_type!r}: raster + PSTH (n={len(cells)}){page_label}', fontsize=13)
-        fig.tight_layout(rect=[0, 0.04, 1, 0.96])
+        fig.tight_layout(rect=[0, 0.01, 1, 0.96])
         figs.append(fig)
 
     return figs

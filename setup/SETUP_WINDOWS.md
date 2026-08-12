@@ -59,11 +59,7 @@ pip install -U Pillow
 
 ## 8. Set up config.ini
 
-```powershell
-cp src\retinanalysis\config\config.ini.example src\retinanalysis\config\config.ini
-```
-
-Open `src\retinanalysis\config\config.ini` and edit the `[WINDOWS_DEFAULT]` section with real paths for this machine, e.g.:
+This file tells the package where your data actually lives on this machine — it doesn't exist yet, and every machine's paths are different, so you're creating it fresh. Create a new file at `src\retinanalysis\config\config.ini` and paste in the block below, then edit the `[WINDOWS_DEFAULT]` section with real paths for this machine:
 
 ```ini
 [WINDOWS_DEFAULT]
@@ -75,9 +71,19 @@ meta = B:\Array-data\dj_meta
 tags = B:\Array-data\tags
 query = B:\Array-data\sorted
 user = your_username
+
+[WINDOWS_SECONDARY]
+analysis = C:\path\to\secondary\analysis
+data = C:\path\to\secondary\sorted
+raw = C:\path\to\secondary\raw
+h5 = C:\path\to\secondary\h5
+meta = C:\path\to\secondary\meta
+tags = C:\path\to\secondary\tags
+query = C:\path\to\secondary\query
+user = your_username
 ```
 
-`B:` is whatever drive letter your shared network drive is mapped to on this machine — check File Explorer → This PC. `user` is your own username. You only need to fill in `[WINDOWS_DEFAULT]` (and `[WINDOWS_SECONDARY]` if you actually have a second data location) — leave the other sections alone. `config.ini` itself is gitignored, so this is a one-time edit that `git pull` will never touch or overwrite.
+`B:` is whatever drive letter your shared network drive is mapped to on this machine — check File Explorer → This PC. `user` is your own username. Both sections must be present in the file (the package reads both on startup), but you only need to fill in real paths under `[WINDOWS_DEFAULT]` — leave `[WINDOWS_SECONDARY]` as placeholder text unless you actually have a second data location; a path that doesn't exist is just skipped. `config.ini` itself is gitignored, so this file stays local to your machine and `git pull` will never touch or overwrite it.
 
 ## 9. Start the local database
 
@@ -118,6 +124,10 @@ ra.populate_database()
 4. Once the notebook is open, check the kernel name in the top-right corner. If it doesn't say `retinanalysis` (or Python 3.11.13 from that env), click it and switch. If `retinanalysis` isn't in the list at all, run `pip install ipykernel` then `python -m ipykernel install --user --name retinanalysis` inside the activated environment, then refresh the Jupyter tab.
 
 **`DLL load failed` on `import matplotlib`** — see step 7.
+
+**`FileNotFoundError: No config file found at ...`** on `import retinanalysis` — step 8 was skipped, or the file isn't named/placed exactly right. It must be at `src\retinanalysis\config\config.ini` (not `.txt`, not `config.ini.txt` — make sure File Explorer isn't hiding the real extension). Create it as described in step 8, then restart the kernel and re-run.
+
+**`No NAS or SSD paths found, check that one of them is connected`** printed but no crash — `config.ini` exists but still has placeholder paths (e.g. `B:\Array-data\sorted`) that don't actually exist on this machine. Open the file and confirm the `[WINDOWS_DEFAULT]` paths point to a drive/folder that's really there — check File Explorer → This PC for the right drive letter.
 
 **`pip install .\lib\...\utilities\` fails with a compiler error** — the C++ Build Tools from step 3 aren't installed, or you need to open a brand new PowerShell window after installing them.
 

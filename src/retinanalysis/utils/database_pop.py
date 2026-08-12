@@ -808,8 +808,17 @@ def append_experiment(
 # If there are files to parse, throws error for now.
 def parse_data(source: str, dest: str):
     if source.endswith(".h5"):
-        print(f"Need to convert {source} to json")
-        print("going to implement this eventually")
+        # UPDATED 2026-08-12 (Claude, per yas): commented out for now -- these files
+        # already get everything needed from whatever's currently being inserted, so
+        # this was just printing the same "need to convert" message on every single
+        # populate_database() run with no way to resolve it (parse_data still doesn't
+        # actually create the missing json, so the check that triggers this never
+        # stops failing). Re-enable these prints (or actually implement h5->json
+        # conversion below) if these specific .h5 files ever do need to be ingested
+        # directly through this path.
+        # print(f"Need to convert {source} to json")
+        # print("going to implement this eventually")
+        pass
 
 
 def gen_tags(file_to_create: str, dir: str):

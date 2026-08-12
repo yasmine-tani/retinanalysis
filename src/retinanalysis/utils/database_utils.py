@@ -10,17 +10,27 @@ def populate_database(
     tags_dir=TAGS_DIR,
     refresh_existing: bool = False,
 ):
+    # UPDATED 2026-08-12 (Claude, per yas): wraps the actual ingestion in
+    # scrollable_prints() here, inside the function itself, instead of requiring every
+    # notebook to remember `with ra.scrollable_prints():` around this call -- so the
+    # per-file ingestion output is always collapsed into a small scrollable box, no
+    # matter where/how populate_database() gets called. Imported lazily (not at module
+    # level) for the same circular-import reason contrast_response_utils.py's own
+    # lazy `import retinanalysis` calls exist -- database_utils.py loads early during
+    # package init.
+    from retinanalysis.utils.contrast_response_utils import scrollable_prints
 
     schema_module = get_schema_module()
 
-    return database_pop.append_data(
-        h5_dir,
-        meta_dir,
-        tags_dir,
-        username,
-        schema_module,
-        refresh_existing=refresh_existing,
-    )
+    with scrollable_prints():
+        return database_pop.append_data(
+            h5_dir,
+            meta_dir,
+            tags_dir,
+            username,
+            schema_module,
+            refresh_existing=refresh_existing,
+        )
 
 
 def reload_experiment_data(

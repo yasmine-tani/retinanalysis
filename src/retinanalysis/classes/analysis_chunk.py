@@ -525,11 +525,15 @@ class AnalysisChunk:
                 else:
                     d_result[cell] = "Unknown"
 
-            # Always printed (not gated behind self.verbose) -- same policy as the RTMP-missing
-            # warning in get_analysis_vcd(): this is a data-integrity-relevant signal (some raw
-            # classification labels are being silently dropped to "Unknown"), not routine
-            # logging, so it shouldn't be hidden by default.
-            if unmatched_raw_tokens:
+            # UPDATED 2026-08-12 (Claude, per yas): used to always print regardless of
+            # self.verbose. That's fine for one chunk, but plot_mosaics_for_datasets()
+            # constructs an AnalysisChunk per chunk across a whole df_exp_search, so this
+            # fired once per chunk with any mismatched labels -- a wall of near-identical
+            # lines when scanning many datasets. Gated behind self.verbose (default True
+            # for a standalone AnalysisChunk, False when called from
+            # plot_mosaics_for_datasets) so mosaic-plotting stays quiet by default; set
+            # verbose=True to get this diagnostic back.
+            if unmatched_raw_tokens and self.verbose:
                 print(
                     f"[{typing_file}] {len(unmatched_raw_tokens)} raw classification token(s) "
                     "did not match any cell_types.csv entry (even after normalizing "
@@ -792,12 +796,26 @@ class AnalysisChunk:
         for i in range(empty_axes):
             fig.delaxes(cast(Axes, axs[num_axes - 1 - i]))
 
-        # If b_zoom is true, crop each axis to zoom in on the array
+        # If b_zoom is true, crop each axis to zoom in on the array.
+        # UPDATED 2026-08-12 (Claude, per yas -- "n=26 but only one is plotted"): this
+        # used to compute ONE shared x/y window from `filtered_df`, which is the union
+        # of every cell across EVERY type being plotted in this figure, and apply that
+        # same window to every subplot regardless of which type it shows. If any single
+        # cell anywhere in the figure (any type, even one bad RF fit) sits far from the
+        # rest, that shared window balloons out to include it, and every OTHER
+        # subplot's real cluster gets squeezed into a tiny corner -- cells were still
+        # being plotted, just visually crushed to near-invisibility by an unrelated
+        # outlier's zoom requirement. Now computes each subplot's zoom window from only
+        # that subplot's own cell type.
         if b_zoom:
-            x_min, x_max = filtered_df["center_x"].min(), filtered_df["center_x"].max()
-            y_min, y_max = filtered_df["center_y"].min(), filtered_df["center_y"].max()
-
-            for ax in axs:
+            for idx, ct in enumerate(cell_types):
+                ax = axs[idx]
+                ct_ids = list(d_ells_by_type[ct].keys())
+                ct_df = filtered_df.query("cell_id in @ct_ids")
+                if len(ct_df) == 0:
+                    continue
+                x_min, x_max = ct_df["center_x"].min(), ct_df["center_x"].max()
+                y_min, y_max = ct_df["center_y"].min(), ct_df["center_y"].max()
                 ax.set_xlim(
                     (x_min - n_pad) * scale_factor, (x_max + n_pad) * scale_factor
                 )

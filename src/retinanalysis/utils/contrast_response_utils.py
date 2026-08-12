@@ -151,6 +151,43 @@ def scrollable_figure(fig, max_height_px=600, dpi=100):
     ))
 
 
+def scrollable_dataframe(df, max_height_px=400):
+    """
+    NEW 2026-08-12 (Claude, per yas): displays a pandas DataFrame inside a fixed-height,
+    scrollable HTML box -- the dataframe equivalent of scrollable_figure()/
+    scrollable_prints() above.
+
+    yas noticed the dataset-search cells (e.g. `display(exp_search)` after
+    `get_datasets_from_protocol_names('spatialnoise')`, which can come back with 100+
+    rows) get silently truncated by pandas' own default `display.max_rows` -- a plain
+    `display(df)` shows a handful of rows at the top, a handful at the bottom, and
+    "..." in between, so most rows are never actually visible even though they're all
+    still in the dataframe itself. Asked whether that's all they'd be able to see, or
+    if there was a way to get everything.
+
+    This renders the FULL dataframe to HTML (`df.to_html()`, no pandas row truncation)
+    inside a scroll box, same max-height + overflow-y pattern as scrollable_figure() --
+    so every row is reachable by scrolling instead of some being invisible entirely,
+    without the raw output taking up unlimited vertical space in the notebook either.
+
+    Parameters:
+        df (pandas.DataFrame): the dataframe to display in full.
+
+        max_height_px (int): max height of the scrollable box, in pixels. Default 400
+        (a bit taller than scrollable_prints()'s 220 default, since a wide dataframe
+        with column headers needs more room to be readable at all).
+
+    Returns:
+        None -- displays directly, like IPython.display.display().
+    """
+    from IPython.display import display, HTML
+
+    display(HTML(
+        '<div style="max-height:{h}px; overflow-y:auto; border:1px solid #ddd; '
+        'margin-bottom:4px;">{t}</div>'.format(h=max_height_px, t=df.to_html())
+    ))
+
+
 def load_contrast_section(exp_name, contrast_search, protocol_name, condition_keys,
                            analysis_chunk_name, corr_cutoff=0.8, stim_freq_key='temporalFrequency',
                            manual_datafile_name=None, typing_chunk=None, default_ndf=0,

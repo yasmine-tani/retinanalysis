@@ -118,8 +118,13 @@ def plot_mosaics_for_datasets(
     If, after exclusion, a chunk has zero cell types left to plot, that chunk/typing_file
     combination is skipped (reported once) rather than producing an empty figure.
 
-    verbose (bool): If True, restores the old per-chunk "Loading VCD..." console output.
-    Default False (a single compact progress bar is shown instead).
+    verbose (bool): If True, restores the old per-chunk "Loading VCD..." console output,
+    plus every skip/diagnostic message this function itself can print (chunks that
+    failed to load, chunks with no cell types of interest, chunks with no RFs,
+    experiments with no classification files at all, etc.). Default False (only the
+    compact progress bar is shown; mosaics for whatever chunks DO work are plotted
+    silently, per yas: "I just want the mosaics for the available ones shown and
+    that's it").
 
     **kwargs: key value pairs of params fed into the analysis_chunk.plot_rfs function such as
     b_zoom and minimum_n.
@@ -187,9 +192,10 @@ def plot_mosaics_for_datasets(
                 verbose=verbose,
             )
         except Exception as e:
-            tqdm.write(
-                f"Could not load chunk {chunk_name} for {exp} ({ndf_label}), skipping. Error: {e}"
-            )
+            if verbose:
+                tqdm.write(
+                    f"Could not load chunk {chunk_name} for {exp} ({ndf_label}), skipping. Error: {e}"
+                )
             continue
 
         # Only treat files that look like classification/typing files as usable. This is
@@ -207,7 +213,7 @@ def plot_mosaics_for_datasets(
         if preferred_typing_file is not None and preferred_typing_file in classification_files:
             files_to_plot = [preferred_typing_file]
         else:
-            if preferred_typing_file is not None:
+            if preferred_typing_file is not None and verbose:
                 tqdm.write(
                     f"{preferred_typing_file} not found for {exp} {chunk_name}, plotting "
                     f"all available classification file(s) instead: {classification_files}"
@@ -230,10 +236,11 @@ def plot_mosaics_for_datasets(
                 ]
 
                 if not plot_cell_types:
-                    tqdm.write(
-                        f"No cell types of interest (after excluding {exclude_keywords}) for "
-                        f"{exp} {chunk_name} ({typing_file}, {ndf_label}), skipping."
-                    )
+                    if verbose:
+                        tqdm.write(
+                            f"No cell types of interest (after excluding {exclude_keywords}) for "
+                            f"{exp} {chunk_name} ({typing_file}, {ndf_label}), skipping."
+                        )
                     continue
 
             rf_axes = analysis_chunk.plot_rfs(
@@ -241,15 +248,17 @@ def plot_mosaics_for_datasets(
             )
 
             if rf_axes is None or len(rf_axes) == 0:
-                tqdm.write(f"No RFs for {exp} {chunk_name} ({typing_file}, {ndf_label})")
+                if verbose:
+                    tqdm.write(f"No RFs for {exp} {chunk_name} ({typing_file}, {ndf_label})")
                 continue
 
             fig = rf_axes[0].get_figure()
             fig.suptitle(f"{exp} {chunk_name} | {ndf_label} | {typing_file}")
             ls_rf_axes.append(rf_axes)
 
-    for exp in checked_exps - classified_exps:
-        tqdm.write(f"No classification files found for any noise chunk in {exp}")
+    if verbose:
+        for exp in checked_exps - classified_exps:
+            tqdm.write(f"No classification files found for any noise chunk in {exp}")
 
     return ls_rf_axes
 

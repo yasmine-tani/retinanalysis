@@ -1029,9 +1029,19 @@ def plot_raster_and_psth_for_cell_type(df_trials, spike_times_by_cell, df_epochs
     for page in range(n_pages):
         page_cells = cells[page * max_cells_per_page:(page + 1) * max_cells_per_page]
         ncols = len(page_cells)
+        # UPDATED 2026-08-11 (per yas -- the first attempt at this scaled the raster up
+        # too, which wasn't wanted: "why did you double the y of the rasters i just
+        # wanted the historgam mosaic ones dobled but the dimensions ofthe raster the
+        # same"). Original figure: figsize height 6.5, height_ratios=[2, 1]
+        # (raster:PSTH) -> raster=4.33 absolute units, PSTH=2.17. Raster height stays
+        # at 4.33 (unchanged); PSTH height doubles to 4.33 (2 x 2.17) -- new total
+        # figure height 8.67, height_ratios [4.33, 4.33] (equal, since both boxes are
+        # now the same absolute size).
+        _raster_height = 6.5 * (2 / 3)
+        _psth_height = 6.5 * (1 / 3) * 2
         fig, axes = plt.subplots(
-            2, ncols, figsize=(4 * ncols, 6.5), squeeze=False,
-            gridspec_kw={'height_ratios': [2, 1]},
+            2, ncols, figsize=(4 * ncols, _raster_height + _psth_height), squeeze=False,
+            gridspec_kw={'height_ratios': [_raster_height, _psth_height]},
         )
         for i, cell_id in enumerate(page_cells):
             ax_raster = axes[0, i]

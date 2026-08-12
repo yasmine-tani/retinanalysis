@@ -434,3 +434,71 @@ get_cell_pairwise_distances, build_master_mapping_table).
   as equal; `get_cell_pairwise_distances` on 3 planted RF centers still
   returns the closest pair first with the exact expected distance. All
   confirm the docstring/comment rewrite didn't touch any logic.
+
+## 2026-08-11: neighbor distance cutoff for Synchrony Index vs. distance (item 3c)
+
+### Why
+
+Item 3c of yas's post-meeting list (full list in `changes/repo_audit_2026-08-07.md`):
+"Add an upper distance cutoff to correlated-spiking analysis -- compute each cell's
+nearest-neighbor distance, use the median of that distribution, cap inclusion at
+~1.5-2x that median." The "Synchrony Index vs. distance" section plots SI for every
+pairwise combination among the cells that matched every NDF, with no distance limit --
+including same-cell-type pairs on opposite sides of the array, which dilutes/biases
+the real distance relationship with pairs that were never going to show meaningful
+correlation regardless of distance.
+
+### What changed
+
+`src/retinanalysis/utils/correlation_utils.py` -- two new functions, both exported via
+the existing `from .utils.correlation_utils import *` wildcard in `__init__.py` (no
+`__all__` in this module, so both are automatically available as `ra.<name>`):
+
+- `compute_nearest_neighbor_distances(df_pairs, cell_ids=None)`: for every cell, the
+  minimum distance to any other cell in the set (from `get_cell_pairwise_distances`'s
+  output). Returns a `pd.Series` indexed by cell_id.
+- `get_neighbor_distance_cutoff(df_pairs, cell_ids=None, multiplier=1.75)`: median of
+  those per-cell nearest-neighbor distances, times `multiplier`, as the cutoff. Median
+  (not mean) so one cell with an unusually close or unusually isolated nearest
+  neighbor doesn't skew the result. Default `multiplier=1.75` splits yas's stated
+  "~1.5-2x" range -- pass 1.5 or 2.0 explicitly for either end. Returns a dict with
+  `cutoff`, `median_nn_distance`, and the full `nn_distances` Series (for inspecting
+  which cell has the most isolated nearest neighbor, which usually flags a sparse/
+  incomplete mosaic rather than a real spacing outlier). NaN cutoff if fewer than 2
+  cells have a defined nearest-neighbor distance.
+
+`demos/7_correlated_spiking_demo.ipynb`:
+- New cell (`NEIGHBOR_DISTANCE_MULTIPLIER = 1.75`) right after `df_neighbor_pairs` is
+  built, computing and printing the median nearest-neighbor distance, the resulting
+  cutoff, and how many of the pairs among `passed_all_ndf_ids` fall within it.
+- `si_vs_distance_panel` (inside the "Synchrony Index vs. distance" cell) now drops
+  any pair beyond that cutoff before plotting, prints how many pairs were dropped per
+  panel, and notes the cutoff value in each panel's title.
+- Does NOT affect the "Pick two reference cells to correlate" cell (already
+  auto-picks the single closest pair, a cutoff doesn't change that) or the CCF/
+  triplet sections (both work on one specific chosen pair, not a population).
+
+### Verification
+
+Unit-tested both new functions against a synthetic 1D mosaic (5 cells at
+x = 0/100/200/310/900 microns -- 4 realistically-spaced cells plus one far outlier),
+loaded directly with `retinanalysis.utils.datajoint_utils` stubbed (same technique
+used for this module's other synthetic tests, avoids a live DB import):
+- `compute_nearest_neighbor_distances` matched hand-computed expected values exactly
+  (each of the 4 close cells' nearest neighbor is another close cell at 100-110um;
+  the outlier's nearest neighbor is 590um away).
+- `get_neighbor_distance_cutoff` computed median_nn_distance=100, cutoff=175
+  (multiplier=1.75) -- confirmed all 3 immediately-adjacent pairs (100-110um) pass
+  the cutoff, the outlier cell has zero pairs within the cutoff, and 2nd-order pairs
+  (200-210um, farther than typical adjacent spacing allows) are correctly excluded
+  too -- not just the obvious outlier.
+- Edge cases: fewer than 2 cells, and an empty `df_pairs`, both return NaN
+  cutoff/median as documented rather than raising.
+- Notebook re-validated with `nbformat.validate()` + per-cell `compile()` after the
+  edits (25 cells, 0 syntax errors).
+
+**I do not have access to your DataJoint database from this environment, so this has
+not been run against real correlated-spiking data.** The synthetic test confirms the
+arithmetic given known cell positions; please run the notebook and check whether
+`NEIGHBOR_DISTANCE_MULTIPLIER=1.75` feels right for your actual mosaic spacing, or
+whether 1.5/2.0 (or something else) fits your data better.

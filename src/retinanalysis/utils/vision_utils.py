@@ -939,6 +939,34 @@ def ei_corr(
     else:
         raise NameError("Method poperty must be 'full', 'space', or 'power'.")
 
+    # UPDATED 2026-08-11 (Claude, per yas -- this crashed as a cryptic "IndexError:
+    # tuple index out of range" on a different dataset than the ones this had been run
+    # against before, with no indication of what actually went wrong). Root cause:
+    # ref_ids/test_ids ends up empty (every cell in that chunk/block had no usable EI --
+    # see the "EI loading summary"/"ERROR: 0 cells..." prints added to
+    # AnalysisChunk.__init__ and MEAResponseBlock.__init__), so np.array([]) on an empty
+    # list of flattened EIs produces a 1D array with no second axis, and
+    # fixed_ref_eis.shape[1] below raised IndexError with no explanation. This turns
+    # that into an actionable error instead.
+    if fixed_ref_eis.ndim < 2 or fixed_ref_eis.shape[0] == 0:
+        raise ValueError(
+            f"ei_corr: no usable reference EIs ({len(ref_ids)} ref_ids, "
+            f"fixed_ref_eis shape {fixed_ref_eis.shape}). This almost always means "
+            "every cell in the reference object had no usable EI -- check for "
+            "'EI loading summary' / 'ERROR: 0 cells...' printed when that "
+            "AnalysisChunk/MEAResponseBlock was constructed (may be hidden inside a "
+            "`with scrollable_prints():` block above)."
+        )
+    if fixed_test_eis.ndim < 2 or fixed_test_eis.shape[0] == 0:
+        raise ValueError(
+            f"ei_corr: no usable test EIs ({len(test_ids)} test_ids, "
+            f"fixed_test_eis shape {fixed_test_eis.shape}). This almost always means "
+            "every cell in the test object had no usable EI -- check for "
+            "'EI loading summary' / 'ERROR: 0 cells...' printed when that "
+            "AnalysisChunk/MEAResponseBlock was constructed (may be hidden inside a "
+            "`with scrollable_prints():` block above)."
+        )
+
     num_pts = fixed_ref_eis.shape[1]
 
     # Calculate covariance and correlation

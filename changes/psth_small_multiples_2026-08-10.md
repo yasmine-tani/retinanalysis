@@ -103,3 +103,29 @@ rendered to PNG and visually checked) -- axis count is now `2 * n_cells` (was
 `(1 + n_cond) * n_cells`), and the first cell's PSTH y-tick labels read
 `['contrast=0', 'contrast=0.02', ..., 'contrast=0.8']` bottom-to-top, ascending,
 matching the raster's own block order.
+
+## Update 2026-08-11: doubled the figure height for legibility
+
+yas: "make the histogram contrast rasters 2x th size in the y direction so they are
+more legible." `plot_raster_and_psth_for_cell_type`'s figure height went from 6.5 to
+13 (figsize); `height_ratios=[2, 1]` unchanged, so the raster and the banded PSTH box
+both scale up together, proportionally -- not just one half of the figure.
+
+## Update 2026-08-11 (later same day): only the PSTH box should have doubled, not the raster
+
+yas: "why did you double the y of the rasters i just wanted the historgam mosaic ones
+dobled but the dimensions ofthe raster the same" -- the fix above scaled BOTH boxes up
+together, which wasn't the ask. Corrected: the raster keeps its exact original size
+(same `height_ratios` unit share, `2`, at the same per-unit inches scale the original
+6.5-inch-tall/`[2,1]`-ratio figure used -- 6.5 / (2+1) = 2.1667 inches per ratio unit,
+so 2 units = 4.33in for the raster, unchanged from before any of this). The PSTH box
+alone doubles: from 1 unit (2.17in) to 2 units (4.33in) worth of that same per-unit
+scale. New total figure height = 4.33 + 4.33 = 8.67in, `height_ratios=[4.33, 4.33]`
+(computed from those same numbers in code, not hardcoded, so it stays correct if the
+base 6.5/[2,1] constants ever change).
+
+Re-rendered the same synthetic 7-condition test and compared side by side against the
+pre-any-height-change version: raster proportions now visually match the original
+figure exactly (same aspect ratio, same relative size to the page), while the PSTH box
+below it is visibly taller/roomier -- confirms the fix does what was actually asked
+this time, not the "double everything" version from the update above.

@@ -122,6 +122,7 @@ class AnalysisChunk:
         self.cell_ids = np.sort(self.vcd.get_cell_ids())
 
         # Pull EIs into an EI dictionary (if include_ei param is true)
+        loaded_eis = False
         if "include_ei" in vu_kwargs:
             if vu_kwargs["include_ei"] == False:
                 pass
@@ -139,6 +140,7 @@ class AnalysisChunk:
 
                 mask = ~np.isin(self.cell_ids, bad_ids)
                 self.cell_ids = self.cell_ids[mask]
+                loaded_eis = True
         else:
             self.d_EIs = dict()
             bad_ids = []
@@ -153,6 +155,37 @@ class AnalysisChunk:
 
             mask = ~np.isin(self.cell_ids, bad_ids)
             self.cell_ids = self.cell_ids[mask]
+            loaded_eis = True
+
+        # UPDATED 2026-08-11 (Claude, per yas -- a different dataset crashed deep inside
+        # ei_corr() with a cryptic "IndexError: tuple index out of range", traced back to
+        # this chunk having ZERO cells with a usable EI after the per-cell drop loop
+        # above). The per-cell "WARNING: No ei..." lines above are easy to miss when
+        # there are many of them -- especially since every notebook that builds an
+        # AnalysisChunk does so inside a `with scrollable_prints():` block, which
+        # collapses exactly these prints into a small scrolled box. A single unmissable
+        # summary line (and a hard error-level line if EVERY cell failed) makes this
+        # failure mode diagnosable from the printed output alone, instead of requiring a
+        # trip into ei_corr()'s internals to figure out why fixed_ref_eis had the wrong
+        # shape.
+        if loaded_eis and len(bad_ids) > 0:
+            print(
+                f"EI loading summary for {self.chunk_name}: {len(bad_ids)} / "
+                f"{len(bad_ids) + len(self.cell_ids)} cell(s) had no usable EI and were "
+                f"dropped. {len(self.cell_ids)} cell(s) remain."
+            )
+        if loaded_eis and len(self.cell_ids) == 0:
+            print(
+                f"ERROR: 0 cells in {self.chunk_name} have a usable EI. EI-based cell "
+                "matching (cluster_match/ei_corr, used by create_mea_pipeline and "
+                "build_master_mapping_table) will fail for this chunk with a cryptic "
+                "'IndexError: tuple index out of range' if you proceed -- that error is "
+                "actually this. This usually means either this chunk's .ei file doesn't "
+                "exist / EI computation was never run for it (check the analysis "
+                "directory), or something is systematically wrong with EI loading here "
+                "(see the per-cell WARNING lines above, if any printed) -- not just a "
+                "normal handful of broken cells."
+            )
 
         # Pull timecourses into an timecourse dictionary
         self.d_timecourses = dict()

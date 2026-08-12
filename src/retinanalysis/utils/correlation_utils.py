@@ -526,6 +526,105 @@ def get_cell_pairwise_distances(
     return df_pairs
 
 
+def compute_nearest_neighbor_distances(
+    df_pairs: pd.DataFrame,
+    cell_ids: Optional[List[int]] = None,
+) -> pd.Series:
+    """
+    NEW 2026-08-11 (Claude, per yas, item 3c of a post-meeting list): for every cell,
+    the distance to its single nearest neighbor -- i.e. min(distance) across every pair
+    in df_pairs involving that cell. This is a building block for a mosaic-spacing-based
+    distance cutoff (see get_neighbor_distance_cutoff below), not a per-pair filter by
+    itself.
+
+    Parameters:
+    df_pairs (pd.DataFrame): output of get_cell_pairwise_distances (columns cell_a,
+    cell_b, distance) -- one row per unordered pair.
+
+    cell_ids (optional): restrict to these cell_ids. Default None uses every cell_id
+    appearing in df_pairs.
+
+    Returns:
+    nn_distances (pd.Series): index = cell_id, value = distance (same units as
+    df_pairs) to that cell's nearest neighbor among the other cell_ids in this set. A
+    cell with no pairs at all (e.g. only 1 cell_id given, or that cell_id isn't in
+    df_pairs) is omitted from the result rather than given a NaN entry.
+    """
+    if cell_ids is None:
+        cell_ids = sorted(set(df_pairs["cell_a"]) | set(df_pairs["cell_b"]))
+
+    nn = {}
+    for cid in cell_ids:
+        d = df_pairs.loc[
+            (df_pairs["cell_a"] == cid) | (df_pairs["cell_b"] == cid), "distance"
+        ]
+        if len(d) > 0:
+            nn[cid] = float(d.min())
+
+    return pd.Series(nn, name="nearest_neighbor_distance")
+
+
+def get_neighbor_distance_cutoff(
+    df_pairs: pd.DataFrame,
+    cell_ids: Optional[List[int]] = None,
+    multiplier: float = 1.75,
+) -> Dict[str, object]:
+    """
+    NEW 2026-08-11 (Claude, per yas, item 3c of a post-meeting list): a data-driven
+    upper distance cutoff for which pairs count as "neighbors" in a population
+    correlated-spiking analysis (e.g. Synchrony Index vs. distance), instead of every
+    pairwise combination among a cell type -- including cells on opposite sides of the
+    array, which dilutes/biases a distance relationship with pairs that were never
+    going to show meaningful correlation in the first place, just because they're
+    technically the same cell type.
+
+    Convention: each cell's own nearest-neighbor distance
+    (compute_nearest_neighbor_distances, above) is a real, per-experiment mosaic-
+    spacing measurement -- roughly how far apart adjacent cells of this type actually
+    sit, given this recording's real RF layout, rather than an assumed/fixed distance.
+    The MEDIAN of that per-cell distribution is a robust (outlier-resistant -- won't
+    get dragged around by one cell with an unusually close or unusually isolated
+    nearest neighbor) summary of typical spacing; `multiplier` x that median is the
+    cutoff. yas: "compute each cell's nearest-neighbor distance, use the median of
+    that distribution, cap inclusion at ~1.5-2x that median" -- default multiplier
+    1.75 splits that range; pass 1.5 or 2.0 explicitly for either end of it.
+
+    Parameters:
+    df_pairs (pd.DataFrame): output of get_cell_pairwise_distances.
+
+    cell_ids (optional): same as compute_nearest_neighbor_distances.
+
+    multiplier (float): factor applied to the median nearest-neighbor distance.
+    Default 1.75.
+
+    Returns:
+    dict with keys:
+        cutoff (float): the distance cutoff, same units as df_pairs. NaN if fewer
+        than 2 cells have a defined nearest-neighbor distance (nothing to compute a
+        median from -- e.g. only 1 cell in cell_ids).
+        median_nn_distance (float): the median nearest-neighbor distance itself (NaN
+        under the same condition as cutoff).
+        nn_distances (pd.Series): compute_nearest_neighbor_distances's own output,
+        for inspection -- e.g. to spot a cell whose "nearest neighbor" is
+        suspiciously far, which usually means a sparse/incomplete mosaic (missing
+        cells) rather than a real spacing outlier.
+    """
+    nn_distances = compute_nearest_neighbor_distances(df_pairs, cell_ids=cell_ids)
+    if len(nn_distances) < 2:
+        return {
+            "cutoff": float("nan"),
+            "median_nn_distance": float("nan"),
+            "nn_distances": nn_distances,
+        }
+
+    median_nn = float(nn_distances.median())
+    return {
+        "cutoff": median_nn * multiplier,
+        "median_nn_distance": median_nn,
+        "nn_distances": nn_distances,
+    }
+
+
 def build_master_mapping_table(
     exp_name: str,
     cell_type: str,

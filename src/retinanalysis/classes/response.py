@@ -331,6 +331,33 @@ class MEAResponseBlock(ResponseBlock):
                 mask = ~np.isin(self.cell_ids, bad_ids)
                 self.cell_ids = self.cell_ids[mask]
 
+                # UPDATED 2026-08-11 (Claude, per yas -- see the matching change in
+                # AnalysisChunk.__init__ for the full story): a per-cell WARNING here
+                # is easy to miss when there are many of them, especially inside a
+                # `with scrollable_prints():` block (used everywhere this class gets
+                # constructed). If EVERY cell in this block failed EI loading,
+                # ei_corr() will crash later with a cryptic "IndexError: tuple index
+                # out of range" -- this makes that failure mode diagnosable from the
+                # printed output alone.
+                if len(bad_ids) > 0:
+                    print(
+                        f"EI loading summary for {self.datafile_name}: {len(bad_ids)} / "
+                        f"{len(bad_ids) + len(self.cell_ids)} cell(s) had no usable EI "
+                        f"and were dropped. {len(self.cell_ids)} cell(s) remain."
+                    )
+                if len(self.cell_ids) == 0:
+                    print(
+                        f"ERROR: 0 cells in {self.datafile_name} have a usable EI. "
+                        "EI-based cell matching (cluster_match/ei_corr, used by "
+                        "create_mea_pipeline and build_master_mapping_table) will "
+                        "fail for this block with a cryptic 'IndexError: tuple index "
+                        "out of range' if you proceed -- that error is actually this. "
+                        "This usually means either this block's .ei file doesn't "
+                        "exist / EI computation was never run for it, or something is "
+                        "systematically wrong with EI loading here (see the per-cell "
+                        "WARNING lines above, if any printed)."
+                    )
+
             self.get_spike_times()
 
         # If pkl_file is provided, everything else is already loaded in parent init.

@@ -30,7 +30,7 @@ dependencies = [
   "progressbar2",
   "Cython",
   "setuptools<81",
-  "opencv-python",
+  "opencv-python-headless",
   "matplotlib",
   "scikit-learn",
   "pybind11",

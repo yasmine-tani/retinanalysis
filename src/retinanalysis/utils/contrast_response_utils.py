@@ -312,6 +312,163 @@ def load_contrast_section(exp_name, contrast_search, protocol_name, condition_ke
     return df_trials, spike_times_by_cell, df_epochs, datafile_name, ndf_used
 
 
+def _load_trials_by_ndf(exp_name, contrast_search, protocol_name, condition_key,
+                         analysis_chunk_name, corr_cutoff, typing_chunk=None,
+                         baseline_condition_key=None, baseline_condition_value=0.0):
+    """Shared loading step for every NDF-across-a-protocol function below (single-experiment
+    plotting/export and multi-experiment averaging all call this, so they all load data the
+    same way). Loops every NDF found for `protocol_name` in this experiment (via
+    `ra.get_ndf_blocks_for_protocol`, real database NDF values) and calls
+    load_contrast_section once per NDF.
+
+    Returns a dict of {ndf_val: df_trials}. Progress prints are collapsed into one
+    scrollable box via scrollable_prints().
+    """
+    import retinanalysis as ra
+
+    df_ndf_blocks = ra.get_ndf_blocks_for_protocol(exp_name, protocol_name)
+    if len(df_ndf_blocks) == 0:
+        print(f'No {protocol_name} blocks found for {exp_name} at any NDF.')
+        return {}
+
+    df_trials_by_ndf = {}
+    with scrollable_prints():
+        for _, row in df_ndf_blocks.iterrows():
+            ndf_val = row['NDF']
+            datafile_name = row['datafile_name']
+            print(f'--- NDF {ndf_val} ({datafile_name}) ---')
+            try:
+                df_trials_ndf, _, _, _, _ = load_contrast_section(
+                    exp_name, contrast_search, protocol_name, condition_keys=[condition_key],
+                    analysis_chunk_name=analysis_chunk_name, corr_cutoff=corr_cutoff,
+                    manual_datafile_name=datafile_name, typing_chunk=typing_chunk,
+                    baseline_condition_key=baseline_condition_key,
+                    baseline_condition_value=baseline_condition_value,
+                )
+                df_trials_by_ndf[ndf_val] = df_trials_ndf
+            except Exception as e:
+                print(f'  Skipping NDF {ndf_val}: {e}')
+
+    return df_trials_by_ndf
+
+
+def _population_curve(ct_trials, condition_key, response_col):
+    """Shared population-averaging step: takes a trial-level table already filtered to one
+    cell type (and, for the multi-experiment case, already pooled across experiments), and
+    returns (pop, pop_norm) -- each a dataframe with one row per condition value, columns
+    ['<condition_key>', 'mean', 'sem', 'n_cells']. pop is the raw population mean/SEM; pop_norm
+    is the same thing computed on each cell's response after dividing by that cell's own max
+    (so every cell contributes equally regardless of its absolute firing rate). Returns
+    (None, None) if there's no usable data.
+
+    This is the exact computation plot_crf_across_ndfs draws and
+    get_crf_points_across_ndfs/plot_crf_across_experiments export -- factored out once so the
+    plotted points and the exported points can never drift apart.
+    """
+    curves = ct_trials.groupby(['cell_id', condition_key])[response_col].mean().reset_index()
+    if len(curves) == 0:
+        return None, None
+
+    pop = curves.groupby(condition_key)[response_col].agg(['mean', 'sem']).reset_index()
+    n_cells = curves.groupby(condition_key)['cell_id'].nunique().reset_index(name='n_cells')
+    pop = pop.merge(n_cells, on=condition_key)
+
+    norm_rows = []
+    for cell_id, grp in curves.groupby('cell_id'):
+        m = grp[response_col].max()
+        if m is None or not np.isfinite(m) or m == 0:
+            continue
+        g2 = grp.copy()
+        g2[response_col + '_norm'] = g2[response_col] / m
+        norm_rows.append(g2)
+
+    pop_norm = None
+    if norm_rows:
+        norm_curves = pd.concat(norm_rows, ignore_index=True)
+        pop_norm = norm_curves.groupby(condition_key)[response_col + '_norm'].agg(['mean', 'sem']).reset_index()
+        n_cells_norm = norm_curves.groupby(condition_key)['cell_id'].nunique().reset_index(name='n_cells')
+        pop_norm = pop_norm.merge(n_cells_norm, on=condition_key)
+
+    return pop, pop_norm
+
+
+def _crf_figure(curves_by_ndf, condition_key, response_col, title, log_x, show_sem, even_spacing):
+    """Shared 2-panel (raw / per-cell-normalized) figure builder, one NDF per colored line.
+    `curves_by_ndf` is {ndf_val: (pop, pop_norm)} as returned by _population_curve. Used by
+    both plot_crf_across_ndfs (one experiment) and plot_crf_across_experiments (pooled across
+    experiments) so the two look identical apart from what went into the pooling.
+    """
+    ndf_vals = sorted(curves_by_ndf.keys())
+    if not ndf_vals:
+        return None
+
+    value_to_rank = None
+    if even_spacing and not log_x:
+        all_values = set()
+        for pop, _ in curves_by_ndf.values():
+            if pop is not None:
+                all_values.update(pop[condition_key].astype(float).tolist())
+        value_to_rank = {v: i for i, v in enumerate(sorted(all_values))}
+
+    cmap = plt.get_cmap('viridis')
+    colors = {ndf: cmap(i / max(1, len(ndf_vals) - 1)) for i, ndf in enumerate(ndf_vals)}
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    fig.suptitle(title, fontsize=14)
+    any_plotted = False
+    all_x_values = set()
+
+    for ndf_val in ndf_vals:
+        pop, pop_norm = curves_by_ndf[ndf_val]
+        if pop is None or len(pop) == 0:
+            continue
+
+        x = pop[condition_key].values.astype(float)
+        all_x_values.update(x.tolist())
+        if log_x:
+            x_plot = np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
+        elif value_to_rank is not None:
+            x_plot = np.array([value_to_rank[v] for v in x])
+        else:
+            x_plot = x
+        color = colors[ndf_val]
+        axes[0].errorbar(x_plot, pop['mean'], yerr=(pop['sem'] if show_sem else None),
+                          marker='o', capsize=3, color=color, label=f'NDF {ndf_val:g}')
+
+        if pop_norm is not None and len(pop_norm) > 0:
+            axes[1].errorbar(x_plot, pop_norm['mean'], yerr=(pop_norm['sem'] if show_sem else None),
+                              marker='o', capsize=3, color=color, label=f'NDF {ndf_val:g}')
+
+        any_plotted = True
+
+    if not any_plotted:
+        plt.close(fig)
+        return None
+
+    sem_suffix = ' +/- SEM' if show_sem else ''
+    panel_titles = [f'{response_col} (raw, population mean{sem_suffix})',
+                    f'{response_col} (per-cell normalized{sem_suffix})']
+    panel_cols = [response_col, response_col + '_norm']
+    for ax, panel_title, col in zip(axes, panel_titles, panel_cols):
+        ax.set_xlabel(_condition_axis_label(condition_key))
+        ax.set_ylabel(_response_axis_label(col))
+        ax.set_title(panel_title)
+        ax.grid(True, alpha=0.3)
+        if log_x:
+            ax.set_xscale('log')
+        elif value_to_rank is not None:
+            ax.set_xticks(list(value_to_rank.values()))
+            ax.set_xticklabels([f'{v:g}' for v in value_to_rank.keys()])
+        else:
+            if all_x_values:
+                ax.set_xticks(sorted(all_x_values))
+            if condition_key == 'contrast':
+                ax.set_xlim(0, 1)
+        ax.legend(fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key,
                           analysis_chunk_name, corr_cutoff, response_col, title_prefix,
                           typing_chunk=None, log_x=None, cell_types=None, show_sem=True,
@@ -331,70 +488,37 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
     NDFs overlaid on the same axes the error bars can make the plot busy -- set to False for
     just the mean lines/markers.
 
-    even_spacing (bool): NEW 2026-08-06 (Claude, per yas) -- see plot_crf's docstring for
-    the full reasoning. Only used when log_x is False: places each tested condition value
-    at an evenly-spaced position (not its true numeric position) with the real value as
-    the tick label, so geometrically/log-spaced condition levels (e.g. contrast) don't
-    visually pile up near zero on a true linear axis. Default False.
+    even_spacing (bool): see plot_crf's docstring for the full reasoning. Only used when
+    log_x is False: places each tested condition value at an evenly-spaced position (not its
+    true numeric position) with the real value as the tick label, so geometrically/log-spaced
+    condition levels (e.g. contrast) don't visually pile up near zero on a true linear axis.
+    Default False.
 
-    baseline_condition_key/baseline_condition_value: NEW 2026-08-10 (Claude, per yas, item
-    3a). Passed straight through to load_contrast_section (and from there to
-    ra.build_trial_response_table) for every NDF loaded -- see
-    build_trial_response_table's docstring. Default None keeps the original
+    baseline_condition_key/baseline_condition_value: passed straight through to
+    load_contrast_section (and from there to ra.build_trial_response_table) for every NDF
+    loaded -- see build_trial_response_table's docstring. Default None keeps the original
     pre-stimulus-window baseline behavior.
 
-    Returns a dict of {cell_type: fig}.
+    Returns a dict of {cell_type: fig}. To get the exact same points as a dataframe (e.g. for
+    exporting to CSV) instead of/in addition to figures, use get_crf_points_across_ndfs with
+    the same arguments -- it shares this function's loading and population-averaging code, so
+    the numbers are guaranteed to match what's plotted here.
 
     Reloads and re-matches cells at every NDF found (same per-NDF cost as running the NDF
     explorer once per NDF), so this can take a while with several NDFs -- progress prints
     collapse into one scrollable box via scrollable_prints().
     """
-    import retinanalysis as ra
-
     if log_x is None:
         log_x = (condition_key == 'contrast')
 
-    df_ndf_blocks = ra.get_ndf_blocks_for_protocol(exp_name, protocol_name)
-    if len(df_ndf_blocks) == 0:
-        print(f'No {protocol_name} blocks found for {exp_name} at any NDF.')
-        return {}
-
-    # Load each NDF ONCE (the expensive step -- rebuilds the pipeline and EI-matches cells),
-    # not once per cell type. This loop is pure loading (prints only, no figures -- the
-    # figure-creation loop is below, outside this `with` block), so it's wrapped in
-    # scrollable_prints() to collapse the per-NDF progress output into one small scroll box.
-    df_trials_by_ndf = {}
-    with scrollable_prints():
-        for _, row in df_ndf_blocks.iterrows():
-            ndf_val = row['NDF']
-            datafile_name = row['datafile_name']
-            print(f'--- NDF {ndf_val} ({datafile_name}) ---')
-            try:
-                df_trials_ndf, _, _, _, _ = load_contrast_section(
-                    exp_name, contrast_search, protocol_name, condition_keys=[condition_key],
-                    analysis_chunk_name=analysis_chunk_name, corr_cutoff=corr_cutoff,
-                    manual_datafile_name=datafile_name, typing_chunk=typing_chunk,
-                    baseline_condition_key=baseline_condition_key,
-                    baseline_condition_value=baseline_condition_value,
-                )
-                df_trials_by_ndf[ndf_val] = df_trials_ndf
-            except Exception as e:
-                print(f'  Skipping NDF {ndf_val}: {e}')
-
+    df_trials_by_ndf = _load_trials_by_ndf(
+        exp_name, contrast_search, protocol_name, condition_key, analysis_chunk_name,
+        corr_cutoff, typing_chunk=typing_chunk, baseline_condition_key=baseline_condition_key,
+        baseline_condition_value=baseline_condition_value,
+    )
     if not df_trials_by_ndf:
         print('No NDF had usable data -- nothing plotted.')
         return {}
-
-    # Stable value -> rank mapping for even_spacing mode, built ONCE from every
-    # condition value seen across every loaded NDF (condition levels are a stimulus
-    # property, not cell-type-dependent), so every figure/NDF/panel places the same
-    # value at the same x position.
-    value_to_rank = None
-    if even_spacing and not log_x:
-        all_values = set()
-        for df in df_trials_by_ndf.values():
-            all_values.update(df[condition_key].dropna().unique().astype(float).tolist())
-        value_to_rank = {v: i for i, v in enumerate(sorted(all_values))}
 
     if cell_types is None:
         all_types = set()
@@ -402,95 +526,268 @@ def plot_crf_across_ndfs(exp_name, contrast_search, protocol_name, condition_key
             all_types |= set(df['cell_type'].unique())
         cell_types = sorted(t for t in all_types if t not in ('Unknown', 'Unmatched'))
 
-    ndf_vals = sorted(df_trials_by_ndf.keys())
-    cmap = plt.get_cmap('viridis')
-    colors = {ndf: cmap(i / max(1, len(ndf_vals) - 1)) for i, ndf in enumerate(ndf_vals)}
-
     figs = {}
     for ct in cell_types:
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-        fig.suptitle(f'{title_prefix} -- {ct}', fontsize=14)
-        any_plotted = False
-        # UPDATED 2026-08-06 (Claude, per yas): collected across every NDF plotted on
-        # these shared axes, so the tick-setting below (non-log_x case) reflects every
-        # real tested condition value seen, not just whichever NDF happened to be
-        # plotted last.
-        all_x_values = set()
+        curves_by_ndf = {}
+        for ndf_val, df in df_trials_by_ndf.items():
+            ct_trials = df[df['cell_type'] == ct]
+            curves_by_ndf[ndf_val] = _population_curve(ct_trials, condition_key, response_col) \
+                if len(ct_trials) > 0 else (None, None)
 
-        for ndf_val in ndf_vals:
-            ct_trials = df_trials_by_ndf[ndf_val]
-            ct_trials = ct_trials[ct_trials['cell_type'] == ct]
-            if len(ct_trials) == 0:
-                continue
-
-            curves = ct_trials.groupby(['cell_id', condition_key])[response_col].mean().reset_index()
-            if len(curves) == 0:
-                continue
-
-            pop = curves.groupby(condition_key)[response_col].agg(['mean', 'sem']).reset_index()
-            x = pop[condition_key].values.astype(float)
-            all_x_values.update(x.tolist())
-            if log_x:
-                x_plot = np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
-            elif value_to_rank is not None:
-                x_plot = np.array([value_to_rank[v] for v in x])
-            else:
-                x_plot = x
-            color = colors[ndf_val]
-            axes[0].errorbar(x_plot, pop['mean'], yerr=(pop['sem'] if show_sem else None),
-                              marker='o', capsize=3, color=color, label=f'NDF {ndf_val:g}')
-
-            norm_rows = []
-            for cell_id, grp in curves.groupby('cell_id'):
-                m = grp[response_col].max()
-                if m is None or not np.isfinite(m) or m == 0:
-                    continue
-                g2 = grp.copy()
-                g2[response_col + '_norm'] = g2[response_col] / m
-                norm_rows.append(g2)
-            if norm_rows:
-                norm_curves = pd.concat(norm_rows, ignore_index=True)
-                pop_norm = norm_curves.groupby(condition_key)[response_col + '_norm'].agg(['mean', 'sem']).reset_index()
-                axes[1].errorbar(x_plot, pop_norm['mean'], yerr=(pop_norm['sem'] if show_sem else None),
-                                  marker='o', capsize=3, color=color, label=f'NDF {ndf_val:g}')
-
-            any_plotted = True
-
-        if not any_plotted:
-            plt.close(fig)
+        fig = _crf_figure(curves_by_ndf, condition_key, response_col, f'{title_prefix} -- {ct}',
+                           log_x, show_sem, even_spacing)
+        if fig is None:
             print(f'{ct}: no data at any NDF, skipping.')
             continue
-
-        sem_suffix = ' +/- SEM' if show_sem else ''
-        panel_titles = [f'{response_col} (raw, population mean{sem_suffix})',
-                        f'{response_col} (per-cell normalized{sem_suffix})']
-        panel_cols = [response_col, response_col + '_norm']
-        for ax, panel_title, col in zip(axes, panel_titles, panel_cols):
-            ax.set_xlabel(_condition_axis_label(condition_key))
-            ax.set_ylabel(_response_axis_label(col))
-            ax.set_title(panel_title)
-            ax.grid(True, alpha=0.3)
-            if log_x:
-                ax.set_xscale('log')
-            elif value_to_rank is not None:
-                # even_spacing: evenly-spaced rank positions, real values as labels --
-                # see plot_crf's even_spacing docstring for the full reasoning.
-                ax.set_xticks(list(value_to_rank.values()))
-                ax.set_xticklabels([f'{v:g}' for v in value_to_rank.keys()])
-            else:
-                # Same "clear 0-1 contrast ticks" convention as plot_crf: tick every
-                # real tested value, fix the axis to the full [0, 1] span specifically
-                # for condition_key == 'contrast' (a value that's conceptually bounded
-                # there), rather than trusting matplotlib's default linear locator.
-                if all_x_values:
-                    ax.set_xticks(sorted(all_x_values))
-                if condition_key == 'contrast':
-                    ax.set_xlim(0, 1)
-            ax.legend(fontsize=8)
-        fig.tight_layout()
         figs[ct] = fig
 
     return figs
+
+
+def get_crf_points_across_ndfs(exp_name, contrast_search, protocol_name, condition_key,
+                                analysis_chunk_name, corr_cutoff, response_col,
+                                typing_chunk=None, cell_types=None,
+                                baseline_condition_key=None, baseline_condition_value=0.0,
+                                save_csv_path=None):
+    """Same loading and population-averaging as plot_crf_across_ndfs, but returns the exact
+    plotted points as a tidy dataframe instead of (or as well as -- call both if you want the
+    figures too) drawing figures. One row per (NDF, cell_type, condition value), columns:
+    'NDF', 'cell_type', condition_key, 'n_cells', 'mean', 'sem', 'mean_norm', 'sem_norm',
+    'n_cells_norm'. 'mean'/'sem' are the raw population values (top-left panel of
+    plot_crf_across_ndfs); 'mean_norm'/'sem_norm' are the per-cell-normalized values
+    (top-right panel). n_cells can differ slightly from n_cells_norm since a cell with a zero
+    or non-finite max response is dropped from the normalized panel only.
+
+    Arguments match plot_crf_across_ndfs (minus the plotting-only ones: title_prefix, log_x,
+    show_sem, even_spacing) so you can call this with the same parameters you used to make a
+    plot and get back the numbers behind it.
+
+    save_csv_path (str, optional): if given, also writes the dataframe to this path via
+    df.to_csv(save_csv_path, index=False).
+    """
+    df_trials_by_ndf = _load_trials_by_ndf(
+        exp_name, contrast_search, protocol_name, condition_key, analysis_chunk_name,
+        corr_cutoff, typing_chunk=typing_chunk, baseline_condition_key=baseline_condition_key,
+        baseline_condition_value=baseline_condition_value,
+    )
+    if not df_trials_by_ndf:
+        print('No NDF had usable data -- nothing to export.')
+        return pd.DataFrame(columns=['NDF', 'cell_type', condition_key, 'n_cells', 'mean', 'sem',
+                                      'mean_norm', 'sem_norm', 'n_cells_norm'])
+
+    if cell_types is None:
+        all_types = set()
+        for df in df_trials_by_ndf.values():
+            all_types |= set(df['cell_type'].unique())
+        cell_types = sorted(t for t in all_types if t not in ('Unknown', 'Unmatched'))
+
+    rows = []
+    for ct in cell_types:
+        for ndf_val, df in df_trials_by_ndf.items():
+            ct_trials = df[df['cell_type'] == ct]
+            if len(ct_trials) == 0:
+                continue
+            pop, pop_norm = _population_curve(ct_trials, condition_key, response_col)
+            if pop is None:
+                continue
+            merged = pop.rename(columns={'mean': 'mean', 'sem': 'sem', 'n_cells': 'n_cells'})
+            if pop_norm is not None:
+                pop_norm = pop_norm.rename(columns={'mean': 'mean_norm', 'sem': 'sem_norm',
+                                                      'n_cells': 'n_cells_norm'})
+                merged = merged.merge(pop_norm, on=condition_key, how='left')
+            else:
+                merged['mean_norm'] = np.nan
+                merged['sem_norm'] = np.nan
+                merged['n_cells_norm'] = 0
+            merged.insert(0, 'cell_type', ct)
+            merged.insert(0, 'NDF', ndf_val)
+            rows.append(merged)
+
+    if not rows:
+        print('No cell type had usable data at any NDF -- nothing to export.')
+        return pd.DataFrame(columns=['NDF', 'cell_type', condition_key, 'n_cells', 'mean', 'sem',
+                                      'mean_norm', 'sem_norm', 'n_cells_norm'])
+
+    df_points = pd.concat(rows, ignore_index=True)
+    if save_csv_path is not None:
+        df_points.to_csv(save_csv_path, index=False)
+        print(f'Saved {len(df_points)} rows to {save_csv_path}')
+    return df_points
+
+
+def _find_typing_chunk_for_experiment(exp_name, manual_analysis_chunk=None, preferred_typing_file=None):
+    """Per-experiment version of what demos/3_contrast_grating_demo.ipynb's setup cells do for
+    a single exp_name: find a classified white-noise chunk (ra.find_classified_noise_chunk,
+    prefers NDF0/NDF1) and build a lightweight AnalysisChunk (no spatial maps, no EI) just for
+    its classification file, so cell_type is available for the response tables built later.
+
+    Used by plot_crf_across_experiments so each experiment in the list gets ITS OWN classified
+    chunk and typing file, rather than incorrectly reusing one experiment's chunk name (e.g.
+    'data017') for every other experiment, which would fail or silently pick the wrong chunk
+    since chunk names aren't shared across experiment days.
+
+    Returns (analysis_chunk_name, typing_chunk) -- either can be None if nothing classified
+    was found for this experiment, in which case cell_type will read 'Unknown' for all its
+    cells (same fallback as the single-experiment notebook cells).
+    """
+    import retinanalysis as ra
+
+    analysis_chunk_name = manual_analysis_chunk or ra.find_classified_noise_chunk(exp_name, verbose=False)
+    if analysis_chunk_name is None:
+        print(f'{exp_name}: no classified NDF0/NDF1 white-noise chunk found -- cell_type will be "Unknown".')
+        return None, None
+
+    typing_chunk = ra.AnalysisChunk(
+        exp_name, analysis_chunk_name, b_load_spatial_maps=False, include_ei=False, verbose=False,
+    )
+    classification_files = [f for f in typing_chunk.typing_files if 'classification' in f.lower()]
+    if not classification_files:
+        print(f'{exp_name}/{analysis_chunk_name}: no classification file -- cell_type will be "Unknown".')
+    elif preferred_typing_file is not None and preferred_typing_file in classification_files:
+        print(f'{exp_name}: using {analysis_chunk_name}, typing file {preferred_typing_file}.')
+    else:
+        print(f'{exp_name}: using {analysis_chunk_name}, typing file {classification_files[0]}.')
+
+    return analysis_chunk_name, typing_chunk
+
+
+def plot_crf_across_experiments(exp_names, contrast_search, protocol_name, condition_key,
+                                 corr_cutoff, response_col, title_prefix,
+                                 manual_analysis_chunks=None, preferred_typing_files=None,
+                                 log_x=None, cell_types=None, show_sem=True,
+                                 even_spacing=False, baseline_condition_key=None,
+                                 baseline_condition_value=0.0, save_csv_path=None):
+    """Same as plot_crf_across_ndfs, but pools cells across MULTIPLE experiments instead of
+    one -- e.g. one averaged CRF per NDF per cell type, combining every matching cell from
+    every experiment in exp_names, rather than one figure per experiment.
+
+    exp_names (List[str]): experiments to pool, e.g. ['20260529A', '20260602A']. Each is
+    loaded the same way plot_crf_across_ndfs loads a single experiment (same
+    get_ndf_blocks_for_protocol + load_contrast_section calls per NDF); an experiment missing
+    `protocol_name` entirely, or missing it at a given NDF, is skipped for that NDF with a
+    printed note rather than raising -- the other experiments still contribute.
+
+    Each experiment's classified white-noise chunk (for cell typing) is found
+    INDEPENDENTLY per experiment, via ra.find_classified_noise_chunk -- unlike
+    plot_crf_across_ndfs/get_crf_points_across_ndfs (single experiment, one chunk you already
+    found in the notebook's setup cells), a chunk name like 'data017' is only meaningful for
+    the one experiment it came from, so this cannot take a single shared analysis_chunk_name
+    the way the single-experiment functions do.
+
+    manual_analysis_chunks (Optional[Dict[str, str]]): per-experiment override, e.g.
+    {'20260529A': 'data017'}, to skip auto-detection for specific experiments. Experiments not
+    in this dict still get auto-detected. Default None (auto-detect every experiment).
+
+    preferred_typing_files (Optional[Dict[str, str]]): per-experiment preferred classification
+    file name, same idea as PREFERRED_TYPING_FILE in the single-experiment notebook cells.
+    Default None (use the first classification file found for each experiment).
+
+    cell_types (default None): auto-detected as the UNION of real types (excluding
+    'Unknown'/'Unmatched') seen across every experiment loaded, not just the first one, since
+    different days can have different cell types typed/present.
+
+    Cells are pooled by (NDF, cell_type, condition value) across every experiment's own
+    cell_ids -- cell_id is only unique WITHIN one experiment, so this relies on
+    _population_curve grouping by cell_id within each experiment's own data before
+    concatenating, not on cell_ids being globally unique across experiments.
+
+    Returns (figs, df_points): figs is {cell_type: fig}, same shape as plot_crf_across_ndfs.
+    df_points is the same tidy format as get_crf_points_across_ndfs, with an added
+    'n_experiments' column (how many of exp_names actually contributed a value for that row).
+
+    save_csv_path (str, optional): if given, also writes df_points to this path.
+    """
+    if log_x is None:
+        log_x = (condition_key == 'contrast')
+    manual_analysis_chunks = manual_analysis_chunks or {}
+    preferred_typing_files = preferred_typing_files or {}
+
+    # Load every experiment's per-NDF trial tables first, tagging each with its own exp_name
+    # so cell_id collisions across experiments (cell_id is only unique within one experiment)
+    # can't silently merge two different cells together downstream.
+    per_exp_trials = {}
+    for exp_name in exp_names:
+        print(f'=== Loading {exp_name} ===')
+        analysis_chunk_name, typing_chunk = _find_typing_chunk_for_experiment(
+            exp_name, manual_analysis_chunks.get(exp_name), preferred_typing_files.get(exp_name),
+        )
+        if analysis_chunk_name is None:
+            print(f'{exp_name}: skipping this experiment entirely (no classified chunk found).')
+            continue
+        df_trials_by_ndf = _load_trials_by_ndf(
+            exp_name, contrast_search, protocol_name, condition_key, analysis_chunk_name,
+            corr_cutoff, typing_chunk=typing_chunk, baseline_condition_key=baseline_condition_key,
+            baseline_condition_value=baseline_condition_value,
+        )
+        if not df_trials_by_ndf:
+            print(f'{exp_name}: no usable NDF data, skipping this experiment entirely.')
+            continue
+        for ndf_val, df in df_trials_by_ndf.items():
+            df = df.copy()
+            df['exp_name'] = exp_name
+            df['cell_id'] = df['exp_name'] + '_' + df['cell_id'].astype(str)
+            per_exp_trials.setdefault(ndf_val, []).append(df)
+
+    if not per_exp_trials:
+        print('No experiment had usable data at any NDF -- nothing plotted.')
+        empty = pd.DataFrame(columns=['NDF', 'cell_type', condition_key, 'n_cells', 'mean', 'sem',
+                                       'mean_norm', 'sem_norm', 'n_cells_norm', 'n_experiments'])
+        return {}, empty
+
+    # Pool: for each NDF, concatenate every contributing experiment's trial rows together.
+    df_trials_by_ndf = {ndf_val: pd.concat(dfs, ignore_index=True) for ndf_val, dfs in per_exp_trials.items()}
+
+    if cell_types is None:
+        all_types = set()
+        for df in df_trials_by_ndf.values():
+            all_types |= set(df['cell_type'].unique())
+        cell_types = sorted(t for t in all_types if t not in ('Unknown', 'Unmatched'))
+
+    figs = {}
+    rows = []
+    for ct in cell_types:
+        curves_by_ndf = {}
+        for ndf_val, df in df_trials_by_ndf.items():
+            ct_trials = df[df['cell_type'] == ct]
+            pop, pop_norm = _population_curve(ct_trials, condition_key, response_col) \
+                if len(ct_trials) > 0 else (None, None)
+            curves_by_ndf[ndf_val] = (pop, pop_norm)
+
+            if pop is not None:
+                n_contributing_exps = ct_trials['exp_name'].nunique()
+                merged = pop.copy()
+                if pop_norm is not None:
+                    pop_norm_r = pop_norm.rename(columns={'mean': 'mean_norm', 'sem': 'sem_norm',
+                                                            'n_cells': 'n_cells_norm'})
+                    merged = merged.merge(pop_norm_r, on=condition_key, how='left')
+                else:
+                    merged['mean_norm'] = np.nan
+                    merged['sem_norm'] = np.nan
+                    merged['n_cells_norm'] = 0
+                merged.insert(0, 'cell_type', ct)
+                merged.insert(0, 'NDF', ndf_val)
+                merged['n_experiments'] = n_contributing_exps
+                rows.append(merged)
+
+        fig = _crf_figure(curves_by_ndf, condition_key, response_col,
+                           f'{title_prefix} -- {ct} (n={len(exp_names)} experiments)',
+                           log_x, show_sem, even_spacing)
+        if fig is None:
+            print(f'{ct}: no data at any NDF, skipping.')
+            continue
+        figs[ct] = fig
+
+    if rows:
+        df_points = pd.concat(rows, ignore_index=True)
+    else:
+        df_points = pd.DataFrame(columns=['NDF', 'cell_type', condition_key, 'n_cells', 'mean', 'sem',
+                                           'mean_norm', 'sem_norm', 'n_cells_norm', 'n_experiments'])
+
+    if save_csv_path is not None:
+        df_points.to_csv(save_csv_path, index=False)
+        print(f'Saved {len(df_points)} rows to {save_csv_path}')
+
+    return figs, df_points
 
 
 def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, log_x=None,

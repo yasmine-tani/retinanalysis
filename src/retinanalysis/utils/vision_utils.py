@@ -20,6 +20,44 @@ import xarray as xr
 from collections import Counter
 
 
+def patch_vision_double_array_bug() -> None:
+    """
+    Work around a bug found in a real installed visionloader build (2026-08-19, per
+    yas -- timecourses showing as a flat line at 0 in the data quality demo, no error).
+
+    visionloader's ParametersFileReader reads two kinds of '.params' fields: single
+    values (x0, y0, SigmaX, SigmaY, Theta, ...) parsed directly in Python, and
+    double-array values (RedTimeCourse, GreenTimeCourse, BlueTimeCourse, ...) filled in
+    by a compiled extension, visionloader.cython_extensions.visionfile_cext
+    .unpack_64bit_float_from_bytearray. Confirmed against a real chunk where every
+    single-value field loaded correctly but every double-array field came back as
+    uninitialized memory (denormalized floats around 1e-312, not real zeros) -- the
+    array LENGTH was always right, only the VALUES were garbage, isolating the bug to
+    that one compiled call.
+
+    This replaces just that one call with an equivalent pure-Python implementation,
+    using the same big-endian double format read correctly everywhere else in
+    ParametersFileReader. Confirmed against the same real chunk to produce real,
+    sane values afterward.
+
+    Call this once, before building any AnalysisChunk/MEAPipeline (e.g. right after
+    `import retinanalysis as ra`) -- anything already built before this runs will
+    still have the old garbage values baked in and needs to be rebuilt. Safe to call
+    more than once.
+    """
+    import visionloader.visionloader as _vl_mod
+
+    def _pure_python_unpack_64bit_float(buffer_array, n_doubles, idx, out_array):
+        raw = bytes(buffer_array[idx : idx + 8 * n_doubles])
+        out_array[:] = np.frombuffer(raw, dtype=">f8", count=n_doubles)
+
+    _vl_mod.vcext.unpack_64bit_float_from_bytearray = _pure_python_unpack_64bit_float
+    print(
+        "Patched visionloader's double-array '.params' field parsing (timecourses, "
+        "etc.) to use a pure-Python fallback instead of the buggy compiled extension."
+    )
+
+
 def _resolve_vision_data_path(exp_name: str, chunk_name: str, ss_version: str) -> str:
     requested_versions = [version for version in [ss_version] if version]
     candidate_versions = list(dict.fromkeys(requested_versions + ["kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined"]))

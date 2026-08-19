@@ -632,6 +632,7 @@ class AnalysisChunk:
         minimum_n: int = 1,
         roi: Optional[Dict[str, float]] = None,
         label_cells: bool = False,
+        exclude_unknown: bool = True,
     ) -> Optional[np.ndarray[Any, np.dtype[np.object_]]]:
         """
         Method for plotting the receptive fields for a given list of cell ids, cell types,
@@ -663,6 +664,11 @@ class AnalysisChunk:
 
             label_cells (bool): If True, put text label with cell id on each ellipse. Default False.
 
+            exclude_unknown (bool): If True (default), drop the 'Unknown' cell type (cells whose
+            classification string didn't match anything in cell_types.csv) from the auto-detected
+            type list when cell_types=None. Has no effect if cell_types is given explicitly --
+            an explicit request for 'Unknown' is still honored.
+
         Returns:
             axs (axes): Axes object that contains all of the axes used in the receptive field figure.
             There will be as many axes as there are cell_types represented in the plot.
@@ -671,6 +677,8 @@ class AnalysisChunk:
             plt.show() on the figure. You need to call plt.show() manually if running as part of a REPL or script.
         """
         # Convert individual cell type or cell id into list
+        cell_types_was_none = cell_types is None
+
         if isinstance(cell_types, str):
             cell_types = [cell_types]
 
@@ -716,6 +724,13 @@ class AnalysisChunk:
             roi_cell_ids = self.get_cells_by_region(roi=roi, units=units)
             filtered_df = filtered_df.query("cell_id in @roi_cell_ids")
             cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+
+        # Cell types auto-detected (not explicitly requested) skip 'Unknown' by default --
+        # cells whose classification string didn't match cell_types.csv, not a real type.
+        # Placed after the roi filter above, since that block re-derives cell_types from
+        # filtered_df and would otherwise silently reintroduce 'Unknown'.
+        if exclude_unknown and cell_types_was_none:
+            cell_types = [ct for ct in cell_types if str(ct).strip().lower() != "unknown"]
 
         # If no cells found after all the above filtering, return
         if len(filtered_df) == 0:
@@ -827,6 +842,220 @@ class AnalysisChunk:
 
         return axs
 
+    def plot_rf_portraits(
+        self,
+        noise_ids: Optional[List[int]] = None,
+        cell_types: Optional[List[str]] = None,
+        typing_file: Optional[str] = None,
+        plot_radius: int = 10,
+        scale_up: int = 4,
+        cmap: str = "RdBu_r",
+        minimum_n: int = 1,
+        n_cols: Optional[int] = None,
+        exclude_unknown: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Plot a grid of small per-cell receptive-field "portraits": each cell's own cropped,
+        polarity-corrected raw spatial STA pixels centered on that cell's RF, rather than the
+        fitted-ellipse mosaic that plot_rfs() draws. One figure is produced per cell type.
+
+        Mirrors the lab's MATLAB plot_rf_portraits.m reference (crop raw RF pixels to a window
+        around each cell's own center, polarity-correct, normalize, tile into a grid). Built on
+        get_stas() (raw per-cell STAs read directly from the native .sta files via
+        visionloader), the same source plot_stas() already uses -- NOT on d_spatial_maps /
+        get_spatial_maps(), which depends on a separately-exported '<ss_version>_params.mat'
+        file that most chunks don't actually have on disk (only a native Vision '.params' file).
+        For each cell, the single time/color frame containing that cell's own peak STA
+        deviation is used, then cropped to a small window around rf_params' center_x/center_y.
+
+        Parameters:
+            noise_ids (List[int]): A list of cell_ids to plot. Default None (all cells).
+
+            cell_types (List[str]): A list of cell_type strings, (e.g. ['OnP', 'OffP']). Default None.
+
+            typing_file (str): Typing file name used to determine cell types. If None, the 0th
+            typing file associated with the analysis chunk is used. Default None.
+
+            plot_radius (int): Half-width, in stixels, of the cropped window around each cell's
+            RF center. Default 10.
+
+            scale_up (int): Integer factor to upscale each cropped portrait for display
+            (nearest-neighbor), matching the MATLAB reference's matrix_scaled_up. Default 4.
+
+            cmap (str): Diverging colormap used to display polarity-corrected, normalized
+            pixels (so a cell's peak deviation is always +1, its opposite pole -1). Default 'RdBu_r'.
+
+            minimum_n (int): Minimum number of cells required for a cell type to be plotted.
+
+            n_cols (int): Number of columns in the portrait grid. Defaults to ceil(sqrt(n_cells)).
+
+            exclude_unknown (bool): If True (default), drop the 'Unknown' cell type from the
+            auto-detected type list when cell_types=None. Has no effect if cell_types is given
+            explicitly.
+
+        Returns:
+            dict of {cell_type: fig}, one figure per cell type plotted. Returns None if no cells
+            match the given filters.
+
+            The function will also plot the results automatically if you're in a jupyter
+            notebook, but it does not call plt.show() on the figure.
+        """
+        # Convert individual cell type or cell id into list
+        cell_types_was_none = cell_types is None
+
+        if isinstance(cell_types, str):
+            cell_types = [cell_types]
+        if isinstance(noise_ids, int) or isinstance(noise_ids, float):
+            noise_ids = [int(noise_ids)]
+
+        # Parse typing file, use typing file 0 if none given
+        if typing_file is None:
+            try:
+                typing_file = self.typing_files[0]
+            except Exception:
+                print(f"No typing files for {self.exp_name} {self.chunk_name}")
+                return None
+
+        if typing_file not in self.typing_files:
+            print(f"{typing_file} Doesn't Exist in {self.exp_name} {self.chunk_name}")
+            return None
+
+        typing_file_idx = self.typing_files.index(typing_file)
+
+        # Pull appropriate union of noise cell ids and cell types using given params.
+        if noise_ids is None and cell_types is None:
+            filtered_df = self.df_cell_params
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        elif noise_ids is None:
+            filtered_df = self.df_cell_params.query(
+                f"typing_file_{typing_file_idx} in @cell_types"
+            )
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        elif cell_types is None:
+            filtered_df = self.df_cell_params.query("cell_id in @noise_ids")
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        else:
+            filtered_df = self.df_cell_params.query(
+                f"typing_file_{typing_file_idx} in @cell_types and cell_id in @noise_ids"
+            )
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+
+        # Cell types auto-detected (not explicitly requested) skip 'Unknown' by default.
+        if exclude_unknown and cell_types_was_none:
+            cell_types = [ct for ct in cell_types if str(ct).strip().lower() != "unknown"]
+
+        if len(filtered_df) == 0:
+            print("No data found for the given noise_ids and cell_types.")
+            return None
+
+        # Remove cell types below minimum_n, same convention as plot_rfs
+        too_few_cells = [
+            ct
+            for ct in cell_types
+            if len(
+                filtered_df.query(f"typing_file_{typing_file_idx} == @ct")[
+                    "cell_id"
+                ].values
+            )
+            < minimum_n
+        ]
+        for ct in too_few_cells:
+            cell_types.remove(ct)
+
+        cell_types = sorted(cell_types)
+
+        # Pull raw STAs for exactly the cells being plotted, organized by cell type --
+        # padded=True so the array's pixel grid lines up with rf_params' center_x/center_y
+        # (both padded to numXChecks/numYChecks the same way; see get_rf_params()).
+        plot_ids = list(
+            filtered_df.query(f"typing_file_{typing_file_idx} in @cell_types")[
+                "cell_id"
+            ].values
+        )
+        d_stas = self.get_stas(
+            noise_ids=plot_ids,
+            cell_types=cell_types,
+            typing_file=typing_file,
+            padded=True,
+            units="stixels",
+        )
+
+        def crop_portrait(cell_id, sta):
+            # sta has shape (T, H, W, 3) -- find this cell's own peak deviation across
+            # every time bin and color channel, same convention plot_stas() uses, then
+            # take just that single spatial frame/channel for the portrait.
+            peak_idx = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
+            t_idx, c_idx = peak_idx[0], peak_idx[3]
+            spat_map = sta[t_idx, :, :, c_idx]
+
+            cy = int(round(self.rf_params[cell_id]["center_y"]))
+            cx = int(round(self.rf_params[cell_id]["center_x"]))
+            r = plot_radius
+            window = np.zeros((2 * r + 1, 2 * r + 1))
+
+            y0, y1 = cy - r, cy + r + 1
+            x0, x1 = cx - r, cx + r + 1
+            src_y0, src_y1 = max(y0, 0), min(y1, spat_map.shape[0])
+            src_x0, src_x1 = max(x0, 0), min(x1, spat_map.shape[1])
+            dst_y0, dst_x0 = src_y0 - y0, src_x0 - x0
+            dst_y1 = dst_y0 + (src_y1 - src_y0)
+            dst_x1 = dst_x0 + (src_x1 - src_x0)
+
+            if src_y1 > src_y0 and src_x1 > src_x0:
+                window[dst_y0:dst_y1, dst_x0:dst_x1] = spat_map[
+                    src_y0:src_y1, src_x0:src_x1
+                ]
+
+            # Polarity-correct so the strongest deviation from zero is always positive,
+            # then normalize to [-1, 1] for a shared, comparable color scale across cells.
+            if np.any(window):
+                peak = window.flat[np.argmax(np.abs(window))]
+                if peak < 0:
+                    window = -window
+                max_abs = np.max(np.abs(window))
+                if max_abs > 0:
+                    window = window / max_abs
+
+            if scale_up > 1:
+                window = np.kron(window, np.ones((scale_up, scale_up)))
+
+            return window
+
+        d_figs = {}
+        for ct in cell_types:
+            ct_ids = list(d_stas.get(ct, {}).keys())
+            if len(ct_ids) == 0:
+                continue
+
+            n_cells = len(ct_ids)
+            cols = n_cols or int(np.ceil(np.sqrt(n_cells)))
+            rows = int(np.ceil(n_cells / cols))
+
+            fig, axs = plt.subplots(
+                nrows=rows,
+                ncols=cols,
+                figsize=(1.6 * cols, 1.6 * rows),
+                layout="constrained",
+            )
+            axs = np.array(axs).flatten() if n_cells > 1 else np.array([axs])
+
+            for idx, cell_id in enumerate(ct_ids):
+                ax = axs[idx]
+                portrait = crop_portrait(cell_id, d_stas[ct][cell_id])
+                ax.imshow(portrait, cmap=cmap, vmin=-1, vmax=1)
+                ax.set_title(str(cell_id), fontsize=8)
+                ax.set_xticks([])
+                ax.set_yticks([])
+
+            num_axes = rows * cols
+            for i in range(n_cells, num_axes):
+                fig.delaxes(cast(Axes, axs[i]))
+
+            fig.suptitle(f"{ct} RF portraits, (n = {n_cells})", fontsize=13)
+            d_figs[ct] = fig
+
+        return d_figs
+
     def plot_timecourses(
         self,
         noise_ids: Optional[List[int]] = None,
@@ -837,6 +1066,8 @@ class AnalysisChunk:
         minimum_n: int = 1,
         roi: Optional[Dict[str, float]] = None,
         roi_units: str = "pixels",
+        exclude_unknown: bool = True,
+        xlim_left_ms: float = -250.0,
     ) -> Optional[np.ndarray[Any, np.dtype[np.object_]]]:
         """
         Method for plotting the timecourses for a given list of cell ids, cell types, or a union of both. If no cell_ids
@@ -863,6 +1094,16 @@ class AnalysisChunk:
             roi_units (str): Units to use when defining the region of interest. Must be 'pixels', 'microns',
             or 'stixels'. Default 'pixels'.
 
+            exclude_unknown (bool): If True (default), drop the 'Unknown' cell type from the
+            auto-detected type list when cell_types=None. Has no effect if cell_types is given
+            explicitly.
+
+            xlim_left_ms (float): Left edge of the plotted x-axis, in milliseconds (converted to
+            the requested `units` automatically). The full timecourse is still computed/averaged
+            over its entire window regardless of this value -- this only crops what's shown, so
+            the actual (usually short, biphasic) response is easier to see instead of being
+            squeezed into a sliver of a much longer window. Default -250.0.
+
         Returns:
             axs (axes): Axes object that contains all of the axes used in the timecourses figure. There
             will be as many axes as there are cell_types represented in the plot.
@@ -872,6 +1113,8 @@ class AnalysisChunk:
 
         """
         # Convert individual cell type or cell id into list
+        cell_types_was_none = cell_types is None
+
         if isinstance(cell_types, str):
             cell_types = [cell_types]
 
@@ -927,6 +1170,12 @@ class AnalysisChunk:
             roi_cell_ids = self.get_cells_by_region(roi=roi, units=roi_units)
             filtered_df = filtered_df.query("cell_id in @roi_cell_ids")
             cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+
+        # Cell types auto-detected (not explicitly requested) skip 'Unknown' by default --
+        # placed after the roi filter above, since that block re-derives cell_types from
+        # filtered_df and would otherwise silently reintroduce 'Unknown'.
+        if exclude_unknown and cell_types_was_none:
+            cell_types = [ct for ct in cell_types if str(ct).strip().lower() != "unknown"]
 
         # Check that we actually have cells to plot
         if len(filtered_df) == 0:
@@ -1032,7 +1281,8 @@ class AnalysisChunk:
             ax.plot(time_vals, d_timecourses_by_type[ct]["b_mean"], "-b")
             ax.fill_between(time_vals, b_err_bottom, b_err_top, alpha=0.4, color="b")
 
-            ax.set_xlim([time_vals[0], time_vals[-1]])
+            ax.set_xlim([xlim_left_ms * scale_factor, time_vals[-1]])
+            ax.axvline(0, color="k", linestyle="--", linewidth=1, alpha=0.6)
 
             ax.set_ylabel(f"STA (arb. units)")
             ax.set_xlabel(f"Time ({units})")
@@ -1193,11 +1443,24 @@ class AnalysisChunk:
                         filtered_df[f"typing_file_{typing_file_idx}"].unique()
                     )
 
-        # Pull STAs and organize by cell id alone, or nested inside a dictionary organized by cell id
-        sta_reader = vl.STAReader(
-            os.path.join(ANALYSIS_DIR, self.exp_name, self.chunk_name, self.ss_version),
-            self.ss_version,
-        )
+        # Pull STAs and organize by cell id alone, or nested inside a dictionary organized by cell id.
+        # UPDATED (Claude, per yas -- AssertionError from vl.STAReader: "analysis_folder_path"
+        # doesn't exist): this used to hardcode ANALYSIS_DIR/exp_name/chunk_name/ss_version as the
+        # only place to look for the .sta file, unlike get_analysis_vcd() (used to build self.vcd,
+        # which is where rf_params/timecourses come from), which tries many DATA_DIR/ANALYSIS_DIR
+        # candidate layouts via _resolve_vision_data_path(). That's why rf_params could load fine
+        # while get_stas()/plot_stas()/plot_rf_portraits() hit a hard AssertionError for the same
+        # chunk -- the .sta file was never actually missing, just not where this one hardcoded path
+        # was looking. Now uses the same resolver as everything else in this class.
+        sta_dir = _resolve_vision_data_path(self.exp_name, self.chunk_name, self.ss_version)
+        # The .sta file itself is sometimes named for the chunk (e.g. "data005.sta") and
+        # sometimes for the spike-sorting version (e.g. "kilosort2.5.sta"), depending on
+        # layout -- same ambiguity get_analysis_vcd() already resolves for self.vcd's
+        # dataset_name. Prefer chunk_name, fall back to ss_version if that file isn't there.
+        sta_dataset_name = self.chunk_name
+        if not os.path.isfile(os.path.join(sta_dir, f"{sta_dataset_name}.sta")):
+            sta_dataset_name = self.ss_version
+        sta_reader = vl.STAReader(sta_dir, sta_dataset_name)
 
         if available_types is None:
             id_dict = dict()

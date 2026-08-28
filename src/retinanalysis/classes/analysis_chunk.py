@@ -633,6 +633,7 @@ class AnalysisChunk:
         roi: Optional[Dict[str, float]] = None,
         label_cells: bool = False,
         exclude_unknown: bool = True,
+        title: str = "RFs by Cell Type",
     ) -> Optional[np.ndarray[Any, np.dtype[np.object_]]]:
         """
         Method for plotting the receptive fields for a given list of cell ids, cell types,
@@ -668,6 +669,10 @@ class AnalysisChunk:
             classification string didn't match anything in cell_types.csv) from the auto-detected
             type list when cell_types=None. Has no effect if cell_types is given explicitly --
             an explicit request for 'Unknown' is still honored.
+
+            title (str): Figure suptitle. Default 'RFs by Cell Type' -- override this when
+            plotting the same chunk from two different sources side by side (e.g. protocol
+            chunk vs. reference/typing chunk) so the two figures are distinguishable.
 
         Returns:
             axs (axes): Axes object that contains all of the axes used in the receptive field figure.
@@ -838,7 +843,7 @@ class AnalysisChunk:
                     (y_min - n_pad) * scale_factor, (y_max + n_pad) * scale_factor
                 )
 
-        fig.suptitle("RFs by Cell Type", fontsize=15)
+        fig.suptitle(title, fontsize=15)
 
         return axs
 
@@ -1042,7 +1047,12 @@ class AnalysisChunk:
             for idx, cell_id in enumerate(ct_ids):
                 ax = axs[idx]
                 portrait = crop_portrait(cell_id, d_stas[ct][cell_id])
-                ax.imshow(portrait, cmap=cmap, vmin=-1, vmax=1)
+                # interpolation='nearest' -- these are raw stixel pixels (the whole point
+                # of a portrait vs. the fitted-ellipse mosaic), so matplotlib's default
+                # imshow interpolation ('antialiased', which blurs/smooths neighboring
+                # pixels together) was defeating that and making everything look
+                # over-smoothed. Nearest gives crisp per-stixel blocks instead.
+                ax.imshow(portrait, cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
                 ax.set_title(str(cell_id), fontsize=8)
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -1283,6 +1293,7 @@ class AnalysisChunk:
 
             ax.set_xlim([xlim_left_ms * scale_factor, time_vals[-1]])
             ax.axvline(0, color="k", linestyle="--", linewidth=1, alpha=0.6)
+            ax.axhline(0, color="grey", linestyle="--", linewidth=1, alpha=0.4)
 
             ax.set_ylabel(f"STA (arb. units)")
             ax.set_xlabel(f"Time ({units})")

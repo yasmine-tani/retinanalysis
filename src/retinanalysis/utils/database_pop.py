@@ -282,34 +282,56 @@ def discover_sorting_chunks(experiment_dir: str):
 
     discovered = []
     seen = set()
+    # (yas, 2026-08-28) chunk_name is only ever "data005"/"chunk013" etc -- it doesn't
+    # encode which spike-sorting algorithm produced it. That's fine when kilosort2.5/
+    # kilosort40 live *nested inside* a single datafile folder (data005/kilosort25/,
+    # data005/kilosort40/) -- the loop below finds that folder once and
+    # _iter_sorting_algorithm_dirs() records both algorithms under the one chunk. But
+    # when an experiment is sorted twice with *top-level* algorithm folders instead
+    # (<exp>/kilosort25/data005/, <exp>/kilosort40/data005/), the second loop below used
+    # to add "data005" twice, once per algorithm folder -- two SortingChunk rows with the
+    # identical chunk_name for the same experiment. Nothing enforces chunk_name
+    # uniqueness at the database level, but get_block_chunk() looks a chunk up with
+    # DataJoint's fetch1(), which requires exactly one match and raises when it finds
+    # two -- so any experiment sorted this way silently failed to ingest. Per yas: when
+    # both exist for the same chunk_name, prefer kilosort2.5/kilosort25 and skip the
+    # kilosort4/kilosort40 copy entirely, so exactly one chunk_name gets discovered and
+    # the rest of the pipeline proceeds as if only one sort existed.
+    ALGO_PRIORITY = ["kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined", "ksfiles"]
+    ALGO_DIR_NAMES = set(ALGO_PRIORITY)
+    seen_chunk_names = set()
 
     for entry in sorted(os.listdir(experiment_dir)):
         full_path = os.path.join(experiment_dir, entry)
         if not os.path.isdir(full_path):
             continue
 
-        if entry in {"kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "ksfiles", "combined"}:
+        if entry in ALGO_DIR_NAMES:
             continue
 
         algorithm_dirs = _iter_sorting_algorithm_dirs(full_path)
         has_sorting_subdir = any(
-            child in {"ksfiles", "kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "combined"}
+            child in ALGO_DIR_NAMES
             for child in os.listdir(full_path)
             if os.path.isdir(os.path.join(full_path, child))
         )
 
         if entry.startswith("data") or entry.startswith("chunk") or algorithm_dirs or has_sorting_subdir:
             key = (entry, full_path)
-            if key not in seen:
+            if key not in seen and entry not in seen_chunk_names:
                 discovered.append({"chunk_name": entry, "chunk_path": Path(os.path.realpath(full_path))})
                 seen.add(key)
+                seen_chunk_names.add(entry)
 
-    # Also support an experiment root that contains a top-level algorithm folder such as kilosort25
-    for entry in sorted(os.listdir(experiment_dir)):
-        full_path = os.path.join(experiment_dir, entry)
+    # Also support an experiment root that contains a top-level algorithm folder such as
+    # kilosort25 -- walked in ALGO_PRIORITY order (not alphabetical) so that if the same
+    # chunk_name (e.g. "data005") exists under more than one top-level algorithm folder,
+    # the higher-priority one (kilosort2.5/kilosort25) is discovered first and every
+    # later duplicate is skipped via seen_chunk_names, instead of creating a second
+    # same-named SortingChunk row.
+    for algo_entry in ALGO_PRIORITY:
+        full_path = os.path.join(experiment_dir, algo_entry)
         if not os.path.isdir(full_path):
-            continue
-        if entry not in {"kilosort2.5", "kilosort25", "kilosort40", "kilosort4", "ksfiles", "combined"}:
             continue
 
         for sub_entry in sorted(os.listdir(full_path)):
@@ -317,10 +339,18 @@ def discover_sorting_chunks(experiment_dir: str):
             if not os.path.isdir(sub_path):
                 continue
             if sub_entry.startswith("data") or sub_entry.startswith("chunk"):
+                if sub_entry in seen_chunk_names:
+                    if algo_entry not in ("kilosort2.5", "kilosort25"):
+                        print(
+                            f"{experiment_dir}: '{sub_entry}' also sorted with {algo_entry} -- "
+                            f"skipping that copy, keeping the kilosort2.5/kilosort25 one already found."
+                        )
+                    continue
                 key = (sub_entry, sub_path)
                 if key not in seen:
                     discovered.append({"chunk_name": sub_entry, "chunk_path": Path(os.path.realpath(sub_path))})
                     seen.add(key)
+                    seen_chunk_names.add(sub_entry)
 
     return discovered
 

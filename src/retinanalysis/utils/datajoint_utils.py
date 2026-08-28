@@ -402,10 +402,14 @@ def get_exp_summary(exp_name: str) -> Optional[pd.DataFrame]:
         if len(sorting_chunk_query) > 0:
             epoch_block_query = epoch_block_query * sorting_chunk_query
         else:
+            # chunk_id already exists here (EpochBlock's own native chunk_id column,
+            # projected in at line ~384) -- re-declaring it via proj() as well raises
+            # DataJointError: Attribute `chunk_id` already exists. Only chunk_name is
+            # actually missing in this no-matching-SortingChunk case, so only that
+            # needs to be added as an empty placeholder.
             epoch_block_query = epoch_block_query.proj(
                 ...,
-                chunk_name="" ,
-                chunk_id="",
+                chunk_name="",
             )
     protocol_query = epoch_block_query * schema.Protocol.proj(..., protocol_name="name")  # type: ignore
 

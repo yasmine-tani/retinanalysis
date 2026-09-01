@@ -640,6 +640,7 @@ def get_datasets_from_protocol_names(
         "chunk_id",
         "data_dir",
         "protocol_id",  # type: ignore
+        "start_time",
         group_id="parent_id",
         block_id="id",
     )
@@ -659,6 +660,7 @@ def get_datasets_from_protocol_names(
     ls_order = [
         "exp_name",
         "datafile_name",
+        "start_time",
         "NDF",
         "chunk_name",
         "protocol_name",
@@ -672,6 +674,7 @@ def get_datasets_from_protocol_names(
         "chunk_id",
     ]
     df_exp_search = df_exp_search[ls_order]
+    df_exp_search = df_exp_search.sort_values("start_time").reset_index(drop=True)
 
     n_experiments = df_exp_search["exp_name"].nunique()
     n_blocks = len(df_exp_search)
@@ -800,7 +803,9 @@ def find_datafile_for_protocol(
             )
         return None
 
-    if "block_id" in matches.columns:
+    if "start_time" in matches.columns:
+        matches = matches.sort_values("start_time")
+    elif "block_id" in matches.columns:
         matches = matches.sort_values("block_id")
 
     chosen = matches.iloc[0]["datafile_name"]

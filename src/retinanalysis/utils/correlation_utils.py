@@ -340,7 +340,8 @@ def get_ndf_blocks_for_protocol(
             print(f'No "{protocol_name}" blocks found for {exp_name}.')
         return pd.DataFrame(columns=["NDF", "datafile_name", "block_id"])
 
-    df_proto = df_proto.dropna(subset=["NDF"]).sort_values("block_id")
+    sort_col = "start_time" if "start_time" in df_proto.columns else "block_id"
+    df_proto = df_proto.dropna(subset=["NDF"]).sort_values(sort_col)
 
     rows = []
     for ndf_val, df_ndf in df_proto.groupby("NDF"):

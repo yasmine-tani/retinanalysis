@@ -460,10 +460,16 @@ def fit_naka_rushton(
 
     Returns:
         dict with keys: rmax, c50, n, baseline (fitted parameters), r_squared
-        (goodness of fit), and well_constrained (bool) -- False when the fitted
-        c50 landed at or past the upper bound, meaning the curve didn't actually
-        saturate within the tested contrasts and c50 shouldn't be trusted as a
-        real half-max value even though the fit itself converged.
+        (goodness of fit), and well_constrained (bool) -- True only when the
+        fitted c50 falls within the actual tested contrast range (c50 <=
+        max(contrasts)), i.e. the curve was observed to reach half-max, not
+        extrapolated past it. c50_max_factor only bounds the fit for numerical
+        stability -- it does not make an extrapolated c50 trustworthy, so
+        well_constrained is checked against the real tested range, not that
+        looser bound. A c50 above max(contrasts) is already outside anything
+        that was actually measured; a c50 above 1.0 additionally exceeds
+        Michelson contrast's physical range (contrast can't exceed 100%), so
+        it's not just untested but unmeasurable in principle.
 
     Raises:
         RuntimeError (from scipy.optimize.curve_fit) if the fit doesn't converge --
@@ -503,5 +509,5 @@ def fit_naka_rushton(
         "n": float(n),
         "baseline": float(baseline),
         "r_squared": r_squared,
-        "well_constrained": bool(c50 < c50_max * 0.99),
+        "well_constrained": bool(c50 <= float(np.max(contrasts))),
     }

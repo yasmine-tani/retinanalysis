@@ -52,6 +52,7 @@ dependencies = [
   "bottleneck",
   "scikit-image",
   "platformdirs>=4.9.6",
+  "pywin32; sys_platform == 'win32'",
 ]
 
 [project.urls]

@@ -188,6 +188,74 @@ def scrollable_dataframe(df, max_height_px=400):
     ))
 
 
+def save_all_figures(out_dir, prefix='fig', dpi=200, fmt='png'):
+    """Save every currently-open matplotlib figure to out_dir as separate files.
+
+    Parameters:
+        out_dir (str): folder to save into; created if it doesn't exist.
+        prefix (str): filename prefix; files are named '{prefix}_{n}.{fmt}'.
+        dpi (int): resolution to save at. Default 200.
+        fmt (str): file format matplotlib understands ('png', 'pdf', 'svg', ...).
+
+    Returns:
+        list of the file paths written, one per open figure, in figure-number order.
+    """
+    import os
+
+    os.makedirs(out_dir, exist_ok=True)
+    paths = []
+    for num in plt.get_fignums():
+        fig = plt.figure(num)
+        path = os.path.join(out_dir, f'{prefix}_{num}.{fmt}')
+        fig.savefig(path, dpi=dpi, bbox_inches='tight')
+        paths.append(path)
+    print(f'Saved {len(paths)} figure(s) to {out_dir}')
+    return paths
+
+
+def copy_figure_to_clipboard(fig=None):
+    """Copy a matplotlib figure to the Windows clipboard as an image, so it can be
+    pasted (Ctrl+V) directly into Slack, PowerPoint, Word, etc.
+
+    Windows-only -- requires `pip install pywin32` (already a Windows-only optional
+    dependency in pyproject.toml). Raises ImportError with an install hint if
+    pywin32 isn't available, or on non-Windows platforms.
+
+    Parameters:
+        fig (matplotlib.figure.Figure or None): the figure to copy. Default None,
+        which copies the current/most recent figure (plt.gcf()).
+
+    Returns:
+        None.
+    """
+    try:
+        import win32clipboard
+    except ImportError as e:
+        raise ImportError(
+            "copy_figure_to_clipboard() needs pywin32 (Windows-only). "
+            "Install with: pip install pywin32"
+        ) from e
+    from PIL import Image
+
+    if fig is None:
+        fig = plt.gcf()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', bbox_inches='tight')
+    buf.seek(0)
+    image = Image.open(buf).convert('RGB')
+
+    output = io.BytesIO()
+    image.save(output, 'BMP')
+    data = output.getvalue()[14:]  # strip the 14-byte BMP file header; clipboard wants a DIB
+
+    win32clipboard.OpenClipboard()
+    win32clipboard.EmptyClipboard()
+    win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+    win32clipboard.CloseClipboard()
+    print('Figure copied to clipboard -- paste with Ctrl+V.')
+
+
 def load_contrast_section(exp_name, contrast_search, protocol_name, condition_keys,
                            analysis_chunk_name, corr_cutoff=0.8, stim_freq_key='temporalFrequency',
                            manual_datafile_name=None, typing_chunk=None, default_ndf=0,

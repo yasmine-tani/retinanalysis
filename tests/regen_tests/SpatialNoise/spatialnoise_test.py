@@ -134,7 +134,8 @@ def load_true_frames(str_mat, ds_shape, n_pre_frames=16):
 
     # Clip preframes
     s_frames = s_frames[n_pre_frames:]
-    # idk why stage regen is y-flipped, let's assume yflipping is right thing to do
+    # Stage's regenerated frames come out y-flipped relative to the true stimulus;
+    # flip back to match.
     s_frames = s_frames[:,::-1,...]
 
     print(f'Loaded {s_frames.shape} shape true stimulus frames from {str_mat}')

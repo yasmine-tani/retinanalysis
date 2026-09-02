@@ -828,6 +828,7 @@ def find_classified_noise_chunk(
     preferred_ndfs: List[float] = (0, 1),
     ss_version: str = "kilosort2.5",
     verbose: bool = True,
+    print_stim_params: bool = False,
 ):
     """
     NEW 2026-07-28 (Claude, per yas): auto-pick a noise (cell-typing) chunk for an
@@ -873,6 +874,12 @@ def find_classified_noise_chunk(
 
     verbose (bool): print what was found/chosen and why. Default True -- this is
     meant to be read, since it's making a choice for you.
+
+    print_stim_params (bool): also print the full white-noise stimulus parameter
+    dict for the chosen chunk (NDF, contrast, stixelSize, seed, etc.). This chunk
+    is only ever used for cell typing, not as the subject of analysis, so the
+    parameters are usually not relevant -- default False. Turn on when you're
+    specifically debugging the typing chunk itself.
 
     Returns:
     identifier (str or None): the chosen chunk_name (older experiments that still
@@ -982,15 +989,18 @@ def find_classified_noise_chunk(
                     f"classification file(s): {chosen_files})."
                 )
 
-            try:
-                ep_q = schema.Epoch() & f"parent_id={chosen_block_id}"
-                ep_id = ep_q.to_arrays("id")[0]
-                params = (schema.Epoch() & f"id={ep_id}").fetch1("parameters")
-                print(f"  Stimulus parameters for {chosen_chunk_name}:")
-                for k in sorted(params.keys()):
-                    print(f"    {k}: {params[k]}")
-            except Exception as e:
-                print(f"  Could not fetch stimulus parameters for {chosen_chunk_name}: {e}")
+            if print_stim_params:
+                try:
+                    ep_q = schema.Epoch() & f"parent_id={chosen_block_id}"
+                    ep_id = ep_q.to_arrays("id")[0]
+                    params = (schema.Epoch() & f"id={ep_id}").fetch1("parameters")
+                    print(f"  Stimulus parameters for {chosen_chunk_name}:")
+                    for k in sorted(params.keys()):
+                        print(f"    {k}: {params[k]}")
+                except Exception as e:
+                    print(
+                        f"  Could not fetch stimulus parameters for {chosen_chunk_name}: {e}"
+                    )
 
         return chosen_chunk_name
 

@@ -433,6 +433,7 @@ def fit_naka_rushton(
     contrasts: np.ndarray,
     responses: np.ndarray,
     p0: Optional[List[float]] = None,
+    c50_max_factor: float = 3.0,
 ) -> Dict[str, float]:
     """
     Fit a Naka-Rushton (hyperbolic ratio) function to a contrast-response curve:
@@ -449,14 +450,26 @@ def fit_naka_rushton(
         p0 (Optional[List[float]]): initial guess [rmax, c50, n, baseline]. If
         None, a reasonable guess is derived from the data.
 
+        c50_max_factor (float): upper bound on the fitted c50, expressed as a
+        multiple of the highest tested contrast. Without this, curve_fit is free
+        to push c50 arbitrarily high for a cell whose response never clearly
+        saturates in the tested range -- mathematically a valid least-squares
+        solution, but not a physically meaningful "half-max contrast" (e.g. a
+        fitted c50 of 30 when contrast only ever went up to ~1 just means the
+        cell didn't saturate, not that its true c50 is 30). Default 3x.
+
     Returns:
-        dict with keys: rmax, c50, n, baseline (fitted parameters), and
-        r_squared (goodness of fit).
+        dict with keys: rmax, c50, n, baseline (fitted parameters), r_squared
+        (goodness of fit), and well_constrained (bool) -- False when the fitted
+        c50 landed at or past the upper bound, meaning the curve didn't actually
+        saturate within the tested contrasts and c50 shouldn't be trusted as a
+        real half-max value even though the fit itself converged.
 
     Raises:
         RuntimeError (from scipy.optimize.curve_fit) if the fit doesn't converge --
         this can happen with very noisy or non-saturating data, so check
-        r_squared / the fitted curve visually rather than trusting params blindly.
+        r_squared / well_constrained / the fitted curve visually rather than
+        trusting params blindly.
     """
     contrasts = np.asarray(contrasts, dtype=float)
     responses = np.asarray(responses, dtype=float)
@@ -470,7 +483,9 @@ def fit_naka_rushton(
         )
         p0 = [rmax0, c50_0, 2.0, float(np.min(responses))]
 
-    bounds = ([0, 1e-6, 0.1, -np.inf], [np.inf, np.inf, 10, np.inf])
+    c50_max = float(np.max(contrasts)) * c50_max_factor
+    bounds = ([0, 1e-6, 0.1, -np.inf], [np.inf, c50_max, 10, np.inf])
+    p0[1] = min(p0[1], c50_max * 0.5)
 
     popt, _ = curve_fit(
         _naka_rushton, contrasts, responses, p0=p0, bounds=bounds, maxfev=10000
@@ -488,4 +503,5 @@ def fit_naka_rushton(
         "n": float(n),
         "baseline": float(baseline),
         "r_squared": r_squared,
+        "well_constrained": bool(c50 < c50_max * 0.99),
     }

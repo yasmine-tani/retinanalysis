@@ -4,10 +4,24 @@ import datajoint as dj
 import json
 import os
 import datetime
+import io
+import contextlib
 from pathlib import Path
 from tqdm.auto import tqdm
 
 from retinanalysis._database import get_schema_module
+
+
+def _delete_quiet(query):
+    """Run a DataJoint delete() without printing its per-table cascade summary.
+
+    DataJoint's own delete() prints a row count for every dependent table it
+    cascades through, on top of anything this module prints itself. Use this
+    when verbose=False is requested so ingestion output stays quiet.
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        query.delete(prompt=False)
 
 
 Experiment: dj.Manual = None
@@ -915,6 +929,7 @@ def append_data(
     username: str,
     db_param: object,
     refresh_existing: bool = False,
+    verbose: bool = True,
 ):
     global user
     user = username
@@ -927,14 +942,19 @@ def append_data(
         exp_name = os.path.basename(data)[:-3]
         existing = Experiment & {"exp_name": exp_name}
         if len(existing) == 1 and not refresh_existing:
-            print(f"Already in database: {exp_name}")
+            if verbose:
+                print(f"Already in database: {exp_name}")
             continue
 
         if len(existing) == 1 and refresh_existing:
-            print(f"Refreshing existing experiment: {exp_name}")
-            existing.delete(prompt=False)
+            if verbose:
+                print(f"Refreshing existing experiment: {exp_name}")
+                existing.delete(prompt=False)
+            else:
+                _delete_quiet(existing)
 
-        print("Adding", meta, flush=True)
+        if verbose:
+            print("Adding", meta, flush=True)
         with open(meta, "r") as f:
             meta_dict = json.load(f)
         with open(tags, "r") as f:
@@ -951,12 +971,13 @@ def append_data(
     return records_added
 
 
-def append_celltypefiles(sc_q):
+def append_celltypefiles(sc_q, verbose: bool = True):
     # Get all sorting chunks, each of which we'll look for typing files for.
     df_sc = sc_q.to_pandas().reset_index()
     df_sc = df_sc.set_index("id")
 
-    print("Finding CellTypeFile entries for each chunk...")
+    if verbose:
+        print("Finding CellTypeFile entries for each chunk...")
 
     # Find cell type text files to enter into database.
     ls_insert_ctf = []
@@ -991,11 +1012,12 @@ def append_celltypefiles(sc_q):
                         ls_insert_ctf.append(d_insert)
     CellTypeFile.insert(ls_insert_ctf)
 
-    print(f"Found {len(ls_insert_ctf)} text files in analysis directories.")
-    print(f"There are now {len(CellTypeFile())} entries in CellTypeFile.")
+    if verbose:
+        print(f"Found {len(ls_insert_ctf)} text files in analysis directories.")
+        print(f"There are now {len(CellTypeFile())} entries in CellTypeFile.")
 
 
-def reload_celltypefiles(experiment_names: list = None):
+def reload_celltypefiles(experiment_names: list = None, verbose: bool = True):
     # Deletes and repopulates CellTypeFile table.
     # Optimized so takes ~40s for my NAS connection.
     # TODO: This doesn't update the SortedCellType table,
@@ -1021,8 +1043,11 @@ def reload_celltypefiles(experiment_names: list = None):
         ctf_q = ctf_q & "FALSE"
         # df_delete = (ctf_q * sc_q.proj(...,chunk_id='id')).fetch(format='frame')
         # display(df_delete)
-    print(f"Found {len(sc_q)} chunks for {experiment_names}.")
-    print(f"Deleting associated {len(ctf_q)} cell type files.")
-    ctf_q.delete(prompt=False)
+    if verbose:
+        print(f"Found {len(sc_q)} chunks for {experiment_names}.")
+        print(f"Deleting associated {len(ctf_q)} cell type files.")
+        ctf_q.delete(prompt=False)
+    else:
+        _delete_quiet(ctf_q)
 
-    append_celltypefiles(sc_q)
+    append_celltypefiles(sc_q, verbose=verbose)

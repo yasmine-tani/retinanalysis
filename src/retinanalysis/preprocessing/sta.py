@@ -567,18 +567,20 @@ def write_globals_file(
         micronsPerStixelY=microns_per_stixel,
         xOffset=0.0,
         yOffset=0.0,
-        interval=int(stride),  # MM: same as stride, I think
+        interval=int(stride),
         monitorFrequency=mean_frame_rate,
         framesPerTTL=1,
         refreshPeriod=refreshPeriod,
-        nFramesRequired=-1,  # MM: No idea what this means..
+        nFramesRequired=-1,
         droppedFrames=[],
     )
 
     with GlobalsFileWriter(globals_path, globals_name) as gfw:
         gfw.write_simplified_litke_array_globals_file(
+            # Masked to the low 12 bits: some 120um-pitch array IDs otherwise
+            # overflow the globals file's expected array ID range.
             array_id
-            & 0xFFF,  # FIXME get rid of this after we figure out what happened with 120um
+            & 0xFFF,
             0,
             0,
             "Kilosort converted",

@@ -1772,6 +1772,62 @@ def get_h5_file(exp_name: str) -> str:
         )
 
 
+def get_genotype(exp_name: str, verbose: bool = False) -> Optional[str]:
+    """Read the genotype recorded for an experiment's mouse source, straight from the
+    raw h5 file.
+
+    Genotype isn't in the DataJoint schema yet (it lives in Symphony's free-form
+    'properties' JSON blob on the source, same place age/sex/weight/description live),
+    so this reads it directly from disk rather than via a database query. Returns None
+    (rather than raising) if the h5 has no genotype recorded, since most experiments
+    don't yet -- callers that want to loop over many experiments and skip/flag the
+    missing ones can rely on that instead of catching an exception per experiment.
+
+    Parameters:
+        exp_name (str): experiment name, e.g. '20260715A'.
+
+        verbose (bool): print what was found (or that nothing was found). Default False.
+
+    Returns:
+        genotype (str or None): the genotype string as stored in the h5 (e.g. 'rd10',
+        or whatever bracketed/free-text value Symphony wrote), or None if the h5 has
+        no 'genotype' attribute on any source, or the file/experiment can't be found.
+    """
+    try:
+        h5_path = get_h5_file(exp_name)
+    except FileNotFoundError:
+        if verbose:
+            print(f"{exp_name}: no h5 file found.")
+        return None
+
+    with h5py.File(h5_path, "r") as f:
+        exp_groups = [k for k in f.keys() if k.startswith("experiment-")]
+        if not exp_groups:
+            if verbose:
+                print(f"{exp_name}: no experiment- group found in h5.")
+            return None
+        sources_grp = f.get(f"{exp_groups[0]}/sources")
+        if sources_grp is None:
+            if verbose:
+                print(f"{exp_name}: no sources group found in h5.")
+            return None
+        for source_key in sources_grp.keys():
+            props = sources_grp.get(f"{source_key}/properties")
+            if props is None or "genotype" not in props.attrs:
+                continue
+            raw = props.attrs["genotype"]
+            value = raw.decode() if isinstance(raw, bytes) else str(raw)
+            # Strip Symphony's list-literal bracketing/quoting, e.g. '["rd10"]' -> 'rd10'.
+            value = value.strip("[]\"' ")
+            if verbose:
+                print(f"{exp_name}: genotype = {value!r}")
+            return value
+
+    if verbose:
+        print(f"{exp_name}: no genotype recorded.")
+    return None
+
+
 def get_epochblock_frame_data(
     exp_name: str, block_id: int, str_h5: Optional[str] = None, verbose: bool = True
 ):

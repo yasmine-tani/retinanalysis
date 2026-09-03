@@ -423,6 +423,141 @@ def compute_dsi_osi(
     }
 
 
+def compute_ds_os_summary(exp_name, ds_os_protocol_name, grating_search,
+                           analysis_chunk_name=None, bin_rate=100.0,
+                           dsi_threshold=0.3, osi_threshold=0.3, min_response_hz=2.0,
+                           verbose=False):
+    """Per-experiment DS/OS cell counts and DSI/OSI metrics, factored out of
+    4_grating_dsos_demo.ipynb's per-cell computation (same mean_rate input, same
+    "best (spatialFrequency, temporalFrequency) condition per cell" logic, same default
+    thresholds -- see that notebook for the full reasoning behind these conventions) so
+    it can be run in a loop across multiple experiments for a same-genotype comparison,
+    instead of copy-pasting the notebook's cells once per experiment.
+
+    Parameters:
+        exp_name (str): experiment to analyze.
+
+        ds_os_protocol_name (str): exact protocol_name string for the DS/OS grating
+        stimulus, e.g. 'manookinlab.protocols.GratingDSOS'.
+
+        grating_search (pd.DataFrame): dataset-search dataframe covering this protocol
+        (e.g. ra.get_datasets_from_protocol_names('grating')), used to find the datafile.
+
+        analysis_chunk_name (Optional[str]): skip auto-detection
+        (ra.find_classified_noise_chunk) and use this chunk for cell typing instead.
+
+        bin_rate (float): spike-binning rate in Hz for mean_rate computation. Default 100.
+
+        dsi_threshold / osi_threshold / min_response_hz: same meaning/defaults as the
+        notebook's DSI_THRESHOLD / OSI_THRESHOLD / MIN_RESPONSE_HZ.
+
+        verbose (bool): print pipeline-build/chunk-selection progress. Default False.
+
+    Returns:
+        dict with keys: exp_name, n_cells (cells with a DSI/OSI computed), n_ds_cells,
+        n_os_cells, pct_ds, pct_os, and df_metrics (per-cell dsi/osi/peak_rate/cell_type
+        dataframe, tagged with an exp_name column) -- or None if no datafile/epochs were
+        found for this experiment (skipped, not raised, so a loop over several
+        experiments can keep going).
+    """
+    import retinanalysis as ra
+
+    datafile_name = ra.find_datafile_for_protocol(
+        grating_search, exp_name, protocol_name=ds_os_protocol_name, verbose=verbose
+    )
+    if datafile_name is None:
+        print(f"{exp_name}: no {ds_os_protocol_name} datafile found, skipping.")
+        return None
+
+    if analysis_chunk_name is None:
+        analysis_chunk_name = ra.find_classified_noise_chunk(exp_name, verbose=verbose)
+
+    with ra.scrollable_prints():
+        pipeline = ra.create_mea_pipeline(
+            exp_name, datafile_name, analysis_chunk_name=analysis_chunk_name
+        )
+    response_block = pipeline.resp
+    response_block.bin_spike_times_at_rate(bin_rate=bin_rate, b_count=False)
+    cell_ids = response_block.cell_ids
+    n_epochs = response_block.n_epochs
+
+    df_epochs = pipeline.stim.df_epochs
+    cell_type_by_id = response_block.df_spike_times.set_index("cell_id")["cell_type"]
+
+    rows = []
+    for j_epoch in range(n_epochs):
+        row = df_epochs.iloc[j_epoch]
+        if row["protocol_name"] != ds_os_protocol_name:
+            continue
+        params = row["epoch_parameters"]
+        pre_time_s = row["preTime"] / 1000.0
+        stim_time_s = row["stimTime"] / 1000.0
+        pre_bin = int(round(pre_time_s * bin_rate))
+        stim_bins = int(round(stim_time_s * bin_rate))
+        for i_cell, cell_id in enumerate(cell_ids):
+            full_rate = response_block.binned_spikes[i_cell, j_epoch, :]
+            stim_rate = full_rate[pre_bin : pre_bin + stim_bins]
+            mean_rate = float(np.mean(stim_rate)) if len(stim_rate) else 0.0
+            rows.append({
+                "cell_id": cell_id,
+                "orientation": params["orientation"],
+                "spatialFrequency": params["spatialFrequency"],
+                "temporalFrequency": params.get("temporalFrequency"),
+                "mean_rate": mean_rate,
+            })
+
+    if not rows:
+        print(f"{exp_name}: no {ds_os_protocol_name} epochs found, skipping.")
+        return None
+
+    df_trials = pd.DataFrame(rows)
+    tuning_curves = (
+        df_trials.groupby(["cell_id", "spatialFrequency", "temporalFrequency", "orientation"])["mean_rate"]
+        .mean()
+        .reset_index()
+    )
+
+    cell_metrics = []
+    for cell_id, cell_grp in tuning_curves.groupby("cell_id"):
+        best_peak = -1.0
+        best_row = None
+        for (sf, tf), cond_grp in cell_grp.groupby(["spatialFrequency", "temporalFrequency"]):
+            peak_rate = cond_grp["mean_rate"].max()
+            if peak_rate > best_peak:
+                result = compute_dsi_osi(cond_grp["orientation"].values, cond_grp["mean_rate"].values)
+                best_peak = peak_rate
+                best_row = {"cell_id": cell_id, "best_sf": sf, "best_tf": tf, "peak_rate": peak_rate, **result}
+        if best_row is not None:
+            best_row["cell_type"] = cell_type_by_id.get(cell_id, "Unmatched")
+            cell_metrics.append(best_row)
+
+    df_metrics = pd.DataFrame(cell_metrics)
+    if len(df_metrics) == 0:
+        print(f"{exp_name}: no cells with a computable DSI/OSI, skipping.")
+        return None
+    df_metrics.insert(0, "exp_name", exp_name)
+
+    ds_cells = df_metrics[
+        (df_metrics["dsi"] > dsi_threshold) & (df_metrics["peak_rate"] > min_response_hz)
+    ]
+    os_cells = df_metrics[
+        (df_metrics["osi"] > osi_threshold)
+        & (df_metrics["dsi"] <= dsi_threshold)
+        & (df_metrics["peak_rate"] > min_response_hz)
+    ]
+
+    n_cells = len(df_metrics)
+    return {
+        "exp_name": exp_name,
+        "n_cells": n_cells,
+        "n_ds_cells": len(ds_cells),
+        "n_os_cells": len(os_cells),
+        "pct_ds": 100.0 * len(ds_cells) / n_cells if n_cells else float("nan"),
+        "pct_os": 100.0 * len(os_cells) / n_cells if n_cells else float("nan"),
+        "df_metrics": df_metrics,
+    }
+
+
 def _naka_rushton(c, rmax, c50, n, baseline):
     c = np.asarray(c, dtype=float)
     c_safe = np.clip(c, 0, None)

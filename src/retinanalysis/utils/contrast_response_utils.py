@@ -858,6 +858,215 @@ def plot_crf_across_experiments(exp_names, contrast_search, protocol_name, condi
     return figs, df_points
 
 
+def plot_crf_overlay_by_experiment(exp_names, contrast_search, protocol_name, condition_key,
+                                    corr_cutoff, response_col, title_prefix,
+                                    manual_analysis_chunks=None, preferred_typing_files=None,
+                                    log_x=None, cell_types=None, show_sem=True,
+                                    even_spacing=False, baseline_condition_key=None,
+                                    baseline_condition_value=0.0):
+    """Per-experiment CRF curves overlaid on the same axes (one line per experiment), instead
+    of pooled into a single curve like plot_crf_across_experiments. Use this FIRST, before
+    pooling -- it's the direct way to see whether experiments of the same genotype actually
+    agree with each other, or whether one day is an outlier that shouldn't be pooled in
+    blindly.
+
+    One figure per (cell_type, NDF) combination present in at least one experiment; each line
+    is one experiment's own population mean +/- SEM curve at that NDF. An experiment missing
+    that NDF, or that cell type, is simply absent from that panel's legend rather than an
+    error -- same "skip and note, don't raise" behavior as plot_crf_across_experiments.
+
+    Parameters: same as plot_crf_across_experiments (see its docstring), except there's no
+    save_csv_path -- this is for eyeballing agreement/variation across experiments, not for
+    exporting pooled numbers (use plot_crf_across_experiments/get_crf_points_across_ndfs for
+    that once you've confirmed the experiments agree here).
+
+    Returns:
+        figs: {(cell_type, ndf_val): fig}.
+    """
+    import retinanalysis as ra
+
+    if log_x is None:
+        log_x = (condition_key == 'contrast')
+    manual_analysis_chunks = manual_analysis_chunks or {}
+    preferred_typing_files = preferred_typing_files or {}
+
+    per_exp_trials = {}
+    for exp_name in exp_names:
+        print(f'=== Loading {exp_name} ===')
+        analysis_chunk_name, typing_chunk = _find_typing_chunk_for_experiment(
+            exp_name, manual_analysis_chunks.get(exp_name), preferred_typing_files.get(exp_name),
+        )
+        if analysis_chunk_name is None:
+            print(f'{exp_name}: skipping (no classified chunk found).')
+            continue
+        df_trials_by_ndf = _load_trials_by_ndf(
+            exp_name, contrast_search, protocol_name, condition_key, analysis_chunk_name,
+            corr_cutoff, typing_chunk=typing_chunk, baseline_condition_key=baseline_condition_key,
+            baseline_condition_value=baseline_condition_value,
+        )
+        if df_trials_by_ndf:
+            per_exp_trials[exp_name] = df_trials_by_ndf
+
+    if not per_exp_trials:
+        print('No experiment had usable data at any NDF -- nothing plotted.')
+        return {}
+
+    if cell_types is None:
+        all_types = set()
+        for df_by_ndf in per_exp_trials.values():
+            for df in df_by_ndf.values():
+                all_types |= set(df['cell_type'].unique())
+        cell_types = sorted(t for t in all_types if t not in ('Unknown', 'Unmatched'))
+
+    all_ndfs = sorted({ndf for df_by_ndf in per_exp_trials.values() for ndf in df_by_ndf.keys()})
+    exp_list = list(per_exp_trials.keys())
+    cmap = plt.get_cmap('tab10')
+    colors = {exp_name: cmap(i % 10) for i, exp_name in enumerate(exp_list)}
+
+    figs = {}
+    for ct in cell_types:
+        for ndf_val in all_ndfs:
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+            fig.suptitle(f'{title_prefix} -- {ct}, NDF {ndf_val:g}', fontsize=13)
+            any_plotted = False
+            all_x_values = set()
+
+            value_to_rank = None
+            if even_spacing and not log_x:
+                xs = set()
+                for df_by_ndf in per_exp_trials.values():
+                    df = df_by_ndf.get(ndf_val)
+                    if df is None:
+                        continue
+                    ct_trials = df[df['cell_type'] == ct]
+                    if len(ct_trials):
+                        xs.update(ct_trials[condition_key].astype(float).tolist())
+                value_to_rank = {v: i for i, v in enumerate(sorted(xs))}
+
+            for exp_name in exp_list:
+                df = per_exp_trials[exp_name].get(ndf_val)
+                if df is None:
+                    continue
+                ct_trials = df[df['cell_type'] == ct]
+                if len(ct_trials) == 0:
+                    continue
+                pop, pop_norm = _population_curve(ct_trials, condition_key, response_col)
+                if pop is None or len(pop) == 0:
+                    continue
+
+                x = pop[condition_key].values.astype(float)
+                all_x_values.update(x.tolist())
+                if log_x:
+                    x_plot = np.where(x == 0, x[x > 0].min() / 2 if (x > 0).any() else 0.005, x)
+                elif value_to_rank is not None:
+                    x_plot = np.array([value_to_rank[v] for v in x])
+                else:
+                    x_plot = x
+
+                color = colors[exp_name]
+                axes[0].errorbar(x_plot, pop['mean'], yerr=(pop['sem'] if show_sem else None),
+                                  marker='o', capsize=3, color=color, label=exp_name)
+                if pop_norm is not None and len(pop_norm) > 0:
+                    axes[1].errorbar(x_plot, pop_norm['mean'], yerr=(pop_norm['sem'] if show_sem else None),
+                                      marker='o', capsize=3, color=color, label=exp_name)
+                any_plotted = True
+
+            if not any_plotted:
+                plt.close(fig)
+                continue
+
+            sem_suffix = ' +/- SEM' if show_sem else ''
+            panel_titles = [f'{response_col} (raw, population mean{sem_suffix})',
+                            f'{response_col} (per-cell normalized{sem_suffix})']
+            panel_cols = [response_col, response_col + '_norm']
+            for ax, panel_title, col in zip(axes, panel_titles, panel_cols):
+                ax.set_xlabel(_condition_axis_label(condition_key))
+                ax.set_ylabel(_response_axis_label(col))
+                ax.set_title(panel_title)
+                ax.grid(True, alpha=0.3)
+                if log_x:
+                    ax.set_xscale('log')
+                elif value_to_rank is not None:
+                    ax.set_xticks(list(value_to_rank.values()))
+                    ax.set_xticklabels([f'{v:g}' for v in value_to_rank.keys()])
+                else:
+                    if all_x_values:
+                        ax.set_xticks(sorted(all_x_values))
+                    if condition_key == 'contrast':
+                        ax.set_xlim(0, 1)
+                ax.legend(fontsize=8)
+            fig.tight_layout()
+            figs[(ct, ndf_val)] = fig
+
+    return figs
+
+
+def get_naka_rushton_fits_across_experiments(exp_names, contrast_search, protocol_name,
+                                              corr_cutoff, response_col='f1', ndf_target=0,
+                                              manual_analysis_chunks=None, preferred_typing_files=None):
+    """Per-cell Naka-Rushton fits (ra.fit_naka_rushton) for every experiment in exp_names, at
+    one chosen NDF, combined into a single tagged dataframe -- for comparing c50 distributions
+    across same-genotype experiments (e.g. a boxplot grouped by exp_name).
+
+    Each cell's response_col is normalized to its own max before fitting, same convention as
+    the single-experiment cell this is factored out of (3_contrast_grating_demo.ipynb).
+
+    ndf_target (float): which NDF to fit at. Default 0. An experiment missing this NDF is
+    skipped with a printed note.
+
+    Returns:
+        df_fits (pd.DataFrame): one row per (exp_name, cell_id) with rmax/c50/n/baseline/
+        r_squared/well_constrained (same as ra.fit_naka_rushton's return dict) plus exp_name
+        and cell_id. Only cells with a successful fit are included -- a cell is skipped if it
+        had no positive response at any contrast, or if curve_fit itself failed to converge,
+        same as the notebook cell this is based on.
+    """
+    import retinanalysis as ra
+
+    manual_analysis_chunks = manual_analysis_chunks or {}
+    preferred_typing_files = preferred_typing_files or {}
+    all_fit_rows = []
+
+    for exp_name in exp_names:
+        print(f'=== {exp_name} ===')
+        analysis_chunk_name, typing_chunk = _find_typing_chunk_for_experiment(
+            exp_name, manual_analysis_chunks.get(exp_name), preferred_typing_files.get(exp_name),
+        )
+        if analysis_chunk_name is None:
+            continue
+        df_trials_by_ndf = _load_trials_by_ndf(
+            exp_name, contrast_search, protocol_name, 'contrast', analysis_chunk_name,
+            corr_cutoff, typing_chunk=typing_chunk,
+        )
+        df_trials = df_trials_by_ndf.get(ndf_target)
+        if df_trials is None:
+            print(f'{exp_name}: no data at NDF {ndf_target}, skipping.')
+            continue
+
+        contrast_curves = df_trials.groupby(['cell_id', 'contrast'])[response_col].mean().reset_index()
+        for cell_id, grp in contrast_curves.groupby('cell_id'):
+            grp = grp.sort_values('contrast')
+            max_val = grp[response_col].max()
+            if max_val is None or not np.isfinite(max_val) or max_val <= 0:
+                continue
+            norm_vals = grp[response_col].values / max_val
+            try:
+                fit = ra.fit_naka_rushton(grp['contrast'].values, norm_vals)
+            except RuntimeError:
+                continue
+            fit['exp_name'] = exp_name
+            fit['cell_id'] = cell_id
+            all_fit_rows.append(fit)
+
+    if not all_fit_rows:
+        print('No successful fits for any experiment.')
+        return pd.DataFrame(columns=['exp_name', 'cell_id', 'rmax', 'c50', 'n', 'baseline',
+                                       'r_squared', 'well_constrained'])
+
+    df_fits = pd.DataFrame(all_fit_rows)
+    return df_fits[['exp_name', 'cell_id', 'rmax', 'c50', 'n', 'baseline', 'r_squared', 'well_constrained']]
+
+
 def plot_crf(df_trials, condition_key, response_col, raw_response_col, title, log_x=None,
              show_noise_sub=True, even_spacing=False):
     """Raw response (row 1) vs. noise-subtracted response (row 2, only if

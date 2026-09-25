@@ -1244,47 +1244,38 @@ class AnalysisChunk:
         noise_ids: Optional[List[int]] = None,
         cell_types: Optional[List[str]] = None,
         typing_file: Optional[str] = None,
-        threshold_sd: float = 5.0,
         minimum_n: int = 1,
         exclude_unknown: bool = True,
     ) -> Optional[pd.DataFrame]:
         """
-        Measure each cell's receptive-field size directly from its raw STA pixels --
-        deliberately NOT from the Gaussian/DoG fit (SigmaX/SigmaY in the .params file).
-        That fit is convenient but not reliably accurate (see e.g. the RF-portrait
-        polarity work and the contrast-response fit auditing elsewhere in this repo --
-        fitted parameters can be subtly wrong or produce implausible outliers). This
-        instead finds the set of "significant" stixels around each cell's own peak STA
-        deviation using a robust noise threshold, the same spirit as the lab's MATLAB
-        significant_stixels.m / get_sta_summaries.m, and reports the physical area/
-        diameter of that measured footprint.
+        Receptive-field diameter per cell, two ways:
 
-        Method, per cell:
-            1. Take the single time/color frame containing the cell's peak |STA deviation|
-               (same convention plot_rf_portraits() uses).
-            2. Estimate the noise floor with a robust (MAD-based) standard deviation of
-               that whole frame -- robust because real RF signal is a small minority of
-               pixels and would otherwise inflate a plain stdev.
-            3. Threshold at threshold_sd x that robust noise std.
-            4. Keep only the connected component of thresholded pixels touching the
-               cell's own peak pixel, so an unrelated noisy stixel elsewhere in the frame
-               (or another cell's RF bleeding into a shared crop) isn't counted.
-            5. RF area = (# pixels in that component) x microns_per_stixel^2.
-               RF diameter = the diameter of a circle with that same area
-               (2 x sqrt(area / pi)) -- reported as an "equivalent diameter" since a real
-               significant-stixel footprint is rarely a perfect circle or ellipse.
+        rf_diameter_halfmax_um (primary): measured from the raw STA. Take the frame with
+            the cell's peak |deviation|, and count the connected stixels around the peak
+            that are at least 50% of the peak value, same sign (center only). Diameter =
+            that of a circle with the same area. The edge is tied to the cell's own peak,
+            not to the noise, so STA quality doesn't systematically shift it (unlike a
+            "N noise SDs above baseline" footprint, which grows as the STA gets cleaner).
+            For a Gaussian RF this equals the full width at half maximum, 2.355 * sigma.
+
+        rf_diameter_gauss_um: from Vision's Gaussian fit (SigmaX, SigmaY in the .params
+            file), using the MATLAB convention: plot_rf_fit.m draws the fit at a 1-SD
+            radius, so diameter = 2 * sqrt(SigmaX * SigmaY) (the diameter of a circle with
+            the same area as the 1-SD ellipse). Only as good as the fit.
+
+        Both in microns (stixels x microns_per_stixel). Stixel size limits precision: an RF
+        6-8 stixels across moves ~15% per stixel at its edge, so type medians are more
+        reliable than single cells. sta_snr (peak / robust noise SD, measured on the real
+        STA grid, not the zero padding of a cropped STA) is included so very noisy cells can
+        be filtered out.
 
         Parameters:
             noise_ids, cell_types, typing_file, minimum_n, exclude_unknown: same meaning
             as plot_rf_portraits().
 
-            threshold_sd (float): number of robust noise SDs a stixel's |deviation| must
-            exceed to count as part of the RF. Default 5.0 (a conventional, conservative
-            threshold in this field -- lower values include more low-confidence pixels).
-
         Returns:
-            pd.DataFrame with one row per cell: cell_id, cell_type, n_significant_stixels,
-            rf_area_um2, rf_diameter_um. Returns None if no cells match the given filters.
+            pd.DataFrame with one row per cell: cell_id, cell_type, rf_diameter_halfmax_um,
+            rf_diameter_gauss_um, sta_snr. None if no cells match the given filters.
         """
         if typing_file is None:
             try:
@@ -1357,56 +1348,45 @@ class AnalysisChunk:
             units="stixels",
         )
 
-        um2_per_stixel = self.microns_per_stixel ** 2
+        um_per_stixel = self.microns_per_stixel
+        y0, x0 = int(self.deltaYChecks), int(self.deltaXChecks)
         rows = []
         for ct in cell_types:
             for cell_id, sta in d_stas.get(ct, {}).items():
                 peak_idx = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
-                t_idx, c_idx = peak_idx[0], peak_idx[3]
-                spat_map = sta[t_idx, :, :, c_idx]
-                peak_y, peak_x = peak_idx[1], peak_idx[2]
+                t_idx, peak_y, peak_x, c_idx = peak_idx
+                spat_map = sta[t_idx, :, :, c_idx].astype(float)
+                peak_val = spat_map[peak_y, peak_x]
 
-                # Robust (MAD-based) noise SD -- real RF signal is a small minority of
-                # pixels in the frame, so a plain std() would be inflated by it.
-                # Estimated on the real STA grid only: with padded=True, a cropped STA
-                # (staX/YChecks < numX/YChecks) is surrounded by zero padding, and on
-                # 20251016A that padding is 75% of the frame, which drove the MAD to 0 and
-                # made every cell's size NaN.
-                y0, x0 = int(self.deltaYChecks), int(self.deltaXChecks)
+                # Noise on the real STA grid only -- a cropped STA is surrounded by zero
+                # padding (75% of the frame on 20251016A), which would drive the MAD to 0.
                 core = spat_map[y0 : y0 + int(self.staYChecks), x0 : x0 + int(self.staXChecks)]
                 if core.size == 0:
                     core = spat_map
                 med = np.median(core)
-                mad = np.median(np.abs(core - med))
-                robust_sd = 1.4826 * mad
-                if robust_sd <= 0 or not np.isfinite(robust_sd):
-                    rows.append({
-                        "cell_id": cell_id, "cell_type": ct,
-                        "n_significant_stixels": 0, "rf_area_um2": np.nan,
-                        "rf_diameter_um": np.nan,
-                    })
-                    continue
+                robust_sd = 1.4826 * np.median(np.abs(core - med))
+                snr = abs(peak_val - med) / robust_sd if robust_sd > 0 else np.nan
 
-                # Same sign as the peak only, so opposite-sign surround pixels touching the
-                # center can't be counted as part of it.
-                peak_sign = np.sign(spat_map[peak_y, peak_x] - med)
-                significant = peak_sign * (spat_map - med) > (threshold_sd * robust_sd)
-                labeled, _ = ndi_label(significant)
-                peak_label = labeled[peak_y, peak_x]
-                if peak_label == 0:
-                    # Peak pixel itself didn't clear threshold (shouldn't normally happen
-                    # since it's the largest deviation in the frame) -- fall back to just
-                    # that single pixel rather than reporting a spurious zero.
-                    n_stixels = 1
-                else:
-                    n_stixels = int(np.sum(labeled == peak_label))
+                d_halfmax = np.nan
+                if peak_val != 0:
+                    labeled, _ = ndi_label(spat_map / peak_val >= 0.5)
+                    n_stixels = int(np.sum(labeled == labeled[peak_y, peak_x]))
+                    d_halfmax = 2.0 * np.sqrt(n_stixels / np.pi) * um_per_stixel
 
-                area_um2 = n_stixels * um2_per_stixel
-                diameter_um = 2.0 * np.sqrt(area_um2 / np.pi)
+                p = self.rf_params.get(cell_id, {})
+                sx, sy = p.get("std_x", np.nan), p.get("std_y", np.nan)
+                d_gauss = (
+                    2.0 * np.sqrt(sx * sy) * um_per_stixel
+                    if np.isfinite(sx) and np.isfinite(sy) and sx > 0 and sy > 0
+                    else np.nan
+                )
+
                 rows.append({
-                    "cell_id": cell_id, "cell_type": ct,
-                    "n_significant_stixels": n_stixels, "rf_area_um2": area_um2,
-                    "rf_diameter_um": diameter_um,
+                    "cell_id": cell_id,
+                    "cell_type": ct,
+                    "rf_diameter_halfmax_um": d_halfmax,
+                    "rf_diameter_gauss_um": d_gauss,
+                    "sta_snr": snr,
                 })
 
         if not rows:

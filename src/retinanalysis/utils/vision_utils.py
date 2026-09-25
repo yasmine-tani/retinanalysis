@@ -804,6 +804,59 @@ def get_rf_contours(
     return d_contours_by_type, scale_factor
 
 
+def plot_rf_sizes(df_rf_sizes: DataFrame, title: str = "RF size by cell type"):
+    """
+    Plot the output of AnalysisChunk.get_rf_sizes_from_sta().
+
+    Left: RF diameter per cell type, half-max (blue) next to the Gaussian fit (grey), one
+    dot per cell over a box, to compare types and see the spread within each type (outlying
+    dots are worth a look in the portraits). Right: half-max vs Gaussian diameter per cell,
+    colored by type; the dashed line is what a perfectly Gaussian RF would give
+    (half-max = 1.18 x the 1-SD-radius Gaussian diameter), so cells far off it have RFs
+    that the Gaussian fit describes poorly (or a failed fit).
+
+    Returns the figure.
+    """
+    import matplotlib.pyplot as plt
+
+    d = df_rf_sizes.dropna(subset=["rf_diameter_halfmax_um"])
+    types = sorted(d["cell_type"].unique())
+    fig, (ax, ax2) = plt.subplots(
+        1, 2, figsize=(max(6, 1.6 * len(types)) + 4.5, 4.5),
+        gridspec_kw={"width_ratios": [max(1.5, 0.45 * len(types)), 1]},
+    )
+    rng = np.random.default_rng(0)
+    for i, ct in enumerate(types):
+        g = d[d["cell_type"] == ct]
+        for off, col, color in [(-0.18, "rf_diameter_halfmax_um", "#1f5fd6"), (0.18, "rf_diameter_gauss_um", "0.45")]:
+            vals = g[col].dropna().values
+            if len(vals) == 0:
+                continue
+            ax.boxplot(vals, positions=[i + off], widths=0.3, showfliers=False,
+                       medianprops=dict(color=color, lw=2), boxprops=dict(color=color),
+                       whiskerprops=dict(color=color), capprops=dict(color=color))
+            ax.scatter(i + off + rng.uniform(-0.08, 0.08, len(vals)), vals, s=10, color=color, alpha=0.6, zorder=3)
+    ax.set_xticks(range(len(types)))
+    ax.set_xticklabels([f"{ct}\n(n={int((d['cell_type'] == ct).sum())})" for ct in types], rotation=30, ha="right")
+    ax.set_ylabel("RF diameter (\u00b5m)")
+    ax.scatter([], [], color="#1f5fd6", label="half-max (raw STA)")
+    ax.scatter([], [], color="0.45", label="Gaussian fit (1-SD radius)")
+    ax.legend(fontsize=8, loc="upper left")
+    ax.set_title(title)
+
+    for i, ct in enumerate(types):
+        g = d[d["cell_type"] == ct]
+        ax2.scatter(g["rf_diameter_gauss_um"], g["rf_diameter_halfmax_um"], s=12, color=f"C{i}", label=ct, alpha=0.8)
+    lim = np.nanmax(d[["rf_diameter_halfmax_um", "rf_diameter_gauss_um"]].values) * 1.05
+    ax2.plot([0, lim], [0, 1.1774 * lim], ls="--", color="0.5", lw=1, label="perfect Gaussian")
+    ax2.set_xlim(0, lim); ax2.set_ylim(0, lim * 1.2)
+    ax2.set_xlabel("Gaussian-fit diameter (\u00b5m)"); ax2.set_ylabel("half-max diameter (\u00b5m)")
+    ax2.set_title("Per cell: half-max vs fit")
+    ax2.legend(fontsize=7, loc="lower right")
+    fig.tight_layout()
+    return fig
+
+
 def get_timecourses(
     analysis_chunk: AnalysisChunk, d_cells_by_type: dict
 ) -> Dict[str, dict]:

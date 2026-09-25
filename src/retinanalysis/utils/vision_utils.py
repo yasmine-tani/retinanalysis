@@ -16,6 +16,7 @@ from pandas import DataFrame
 from visionloader import load_vision_data
 
 from matplotlib.patches import Ellipse, Polygon
+from matplotlib.colors import to_rgba
 from matplotlib.path import Path as MplPath
 from skimage.measure import find_contours
 import xarray as xr
@@ -698,8 +699,8 @@ def get_rf_contours(
         (d_contours_by_type, scale_factor): d_contours_by_type is
         {cell_type: {cell_id: matplotlib.patches.Polygon}}, same dict shape as get_ells()'s
         ellipses, so plot_rfs() can drop either dict into the same axes.add_patch() loop.
-        Drawn as outlines only (edgecolor f'C{idx}', no fill), so overlap between cells is
-        visible. scale_factor is the stixels-to-units conversion actually used (matches
+        Drawn with a light fill (f'C{idx}' at 30% opacity) and a solid outline in the same
+        color, so each RF is highlighted but overlap between cells is still visible. scale_factor is the stixels-to-units conversion actually used (matches
         get_ells()'s). The level/UI used per type is also stored on
         analysis_chunk.last_contour_levels as {cell_type: (level, ui_or_None)}.
     """
@@ -792,8 +793,8 @@ def get_rf_contours(
             d_contours_by_id[cell_id] = Polygon(
                 best_xy * scale_factor,
                 closed=True,
-                facecolor="none",
-                edgecolor=f"C{idx}",
+                facecolor=to_rgba(f"C{idx}", 0.3),  # light fill = highlight
+                edgecolor=to_rgba(f"C{idx}", 1.0),  # solid outline so overlaps stay visible
                 linewidth=1.2,
             )
 

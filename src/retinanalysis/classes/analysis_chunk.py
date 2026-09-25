@@ -1116,10 +1116,24 @@ class AnalysisChunk:
                 ]
                 chan = chans[int(np.argmax(peaks))]
             tcs = {}
+            raw_peak = 0.0
             for c in ct_ids:
                 tc = np.asarray(self.d_timecourses[c][chan], dtype=float)
                 m = np.max(np.abs(tc))
+                raw_peak = max(raw_peak, m)
                 tcs[c] = tc / m if m > 0 else tc
+            if raw_peak < 1e-100:
+                # All-zero or denormalized (~1e-312) values = the visionloader double-array
+                # parsing bug (changes/vcext_double_array_bug_2026-08-19.md), not real data.
+                print(
+                    f"WARNING: timecourses for this chunk are all ~0 (max |value| {raw_peak:.3g}), "
+                    "so the timecourse panels will look blank. This is the visionloader "
+                    "double-array bug: call ra.patch_vision_double_array_bug() right after "
+                    "import, then rebuild the pipeline."
+                )
+                # Draw flat zeros instead of normalized garbage, and skip r/flagging
+                # (every cell would otherwise be falsely flagged).
+                tcs = {c: np.zeros_like(tc) for c, tc in tcs.items()}
             return tcs
 
         d_figs = {}

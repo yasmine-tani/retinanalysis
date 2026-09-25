@@ -68,6 +68,11 @@ from .utils.vision_utils import *
 
 from .utils import parse_data
 
+# Saving figures as editable vector graphics (save_figure) and exporting the numbers
+# behind a plot as CSV (export_figure_data).
+from .utils import export_utils
+from .utils.export_utils import save_figure, export_figure_data, figure_data_to_frame
+
 # Import preprocessing
 from . import preprocessing
 from .preprocessing import sta

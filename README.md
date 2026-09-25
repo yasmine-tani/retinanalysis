@@ -22,11 +22,13 @@ conda --version
 ```
 If that fails, install Miniconda first: https://docs.conda.io/en/latest/miniconda.html
 
-**5. Clone the repo:**
+**5. Clone the repo** (into your home folder, so it's easy to get back to):
 ```powershell
+cd ~
 git clone https://github.com/yasmine-tani/retinanalysis.git --recursive
 cd retinanalysis
 ```
+Keep this window open for the rest of setup. If you close it, open a new Anaconda PowerShell Prompt and run `cd ~/retinanalysis` then `conda activate retinanalysis` (once step 6 has created it) before continuing.
 
 **6. Create the environment and install:**
 ```powershell
@@ -90,7 +92,7 @@ pip install jupyterlab
 jupyter lab
 ```
 
-**11. Populate the database.** Open any notebook in `demos/` and run in a cell:
+**11. Populate the database.** Docker Desktop must be open with the `retinanalysis-database` container running (step 9). `jupyter lab` from step 10 opens a tab in your browser: in the file panel on the left, double-click the `demos` folder, open `1_database_demo.ipynb`, and run this in a cell:
 ```python
 import retinanalysis as ra
 ra.populate_database()
@@ -137,11 +139,13 @@ conda --version
 ```
 If that fails, install Miniconda first: https://docs.conda.io/en/latest/miniconda.html
 
-**4. Clone the repo:**
+**4. Clone the repo** (into your home folder, so it's easy to get back to):
 ```bash
+cd ~
 git clone https://github.com/yasmine-tani/retinanalysis.git --recursive
 cd retinanalysis
 ```
+Keep this Terminal open for the rest of setup. If you close it, open a new one and run `cd ~/retinanalysis` then `conda activate retinanalysis` (once step 5 has created it) before continuing.
 
 **5. Create the environment and install:**
 ```bash
@@ -198,7 +202,7 @@ pip install jupyterlab
 jupyter lab
 ```
 
-**9. Populate the database.** Open any notebook in `demos/` and run in a cell:
+**9. Populate the database.** Docker Desktop must be open with the `retinanalysis-database` container running (step 7). `jupyter lab` from step 8 opens a tab in your browser: in the file panel on the left, double-click the `demos` folder, open `1_database_demo.ipynb`, and run this in a cell:
 ```python
 import retinanalysis as ra
 ra.populate_database()
@@ -242,11 +246,13 @@ conda --version
 ```
 If that fails, install Miniconda first: https://docs.conda.io/en/latest/miniconda.html
 
-**4. Clone the repo:**
+**4. Clone the repo** (into your home folder, so it's easy to get back to):
 ```bash
+cd ~
 git clone https://github.com/yasmine-tani/retinanalysis.git --recursive
 cd retinanalysis
 ```
+Keep this Terminal open for the rest of setup. If you close it, open a new one and run `cd ~/retinanalysis` then `conda activate retinanalysis` (once step 5 has created it) before continuing.
 
 **5. Create the environment and install:**
 ```bash
@@ -301,7 +307,7 @@ pip install jupyterlab
 jupyter lab
 ```
 
-**9. Populate the database.** Open any notebook in `demos/` and run in a cell:
+**9. Populate the database.** The `retinanalysis-database` container must be running (step 7; check with `docker compose ps` from `~/retinanalysis-database`). `jupyter lab` from step 8 opens a tab in your browser: in the file panel on the left, double-click the `demos` folder, open `1_database_demo.ipynb`, and run this in a cell:
 ```python
 import retinanalysis as ra
 ra.populate_database()
@@ -335,13 +341,18 @@ On Linux (Docker Engine, no GUI), run `docker compose ps` from inside the `retin
 
 ## Running RetinAnalysis day to day
 
-Once setup is done, starting a normal session is just:
+Once setup is done, every session:
 
+**1. Start the database container.** Windows/Mac: open Docker Desktop and check the `retinanalysis-database` container is running (stop icon); if it shows a play icon, click it. Linux: `cd ~/retinanalysis-database` then `docker compose up -d`. See [Checking that the database container is running](#checking-that-the-database-container-is-running). Only database calls need this — `import retinanalysis` works without it.
+
+**2. Launch Jupyter from the repo folder:**
 ```bash
 conda activate retinanalysis
-cd retinanalysis
+cd ~/retinanalysis
 jupyter lab
 ```
+
+**3. Open a notebook.** In the browser tab that opens, double-click `demos` in the left file panel and open the notebook you want.
 
 **Getting updates:**
 ```bash
@@ -354,6 +365,7 @@ pip install -e .   # only needed if dependencies changed
 [uv](https://docs.astral.sh/uv/) is a fast, Rust-based alternative to conda for managing the Python environment. It works at the project level rather than system-wide — the environment lives in a `.venv` folder inside the repo itself. Use this instead of the conda steps above if you already know uv and prefer it; the rest of setup (Docker, config.ini, populating the database) is identical either way.
 
 ```bash
+cd ~
 git clone https://github.com/yasmine-tani/retinanalysis.git --recursive
 cd retinanalysis
 uv venv --python 3.11.13
@@ -369,6 +381,7 @@ Then continue from the config.ini step for your OS above.
 `install.sh`, included in this repo, bundles several of the manual steps above (create the environment, install retinanalysis and the submodule, create a placeholder `config.ini` if one doesn't exist) into a single command. It's a bash script, so it works out of the box on Mac and Linux Terminal; on Windows it needs Git Bash or WSL, which is why the Windows steps above don't use it. If you're on Mac/Linux and want the shorter path instead of the manual steps:
 
 ```bash
+cd ~/retinanalysis            # install.sh must be run from inside the repo folder
 ./install.sh conda            # or: ./install.sh uv
 ./install.sh conda --dev --env retinanalysis   # optional flags
 ./install.sh uv --python 3.11.13

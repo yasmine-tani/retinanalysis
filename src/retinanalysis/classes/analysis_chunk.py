@@ -958,7 +958,7 @@ class AnalysisChunk:
             auto-detected type list when cell_types=None. Has no effect if cell_types is given
             explicitly.
 
-            with_timecourses (bool): If True, draw each cell's temporal RF (black; computed from
+            with_timecourses (bool): If True, draw each cell's temporal RF (red; computed from
             its STA center pixels, not the .params timecourse fields) next to its portrait, over the mean (blue line) +/- SD (blue shading) of all plotted cells of that type, so a cell whose timecourse
             doesn't match its type (a likely classification mistake or a bad cell) stands out.
             Each timecourse is normalized by its own peak |value| (sign kept, so ON/OFF polarity
@@ -966,8 +966,9 @@ class AnalysisChunk:
             mean of the *other* cells of its type (leave-one-out, so a cell can't inflate its own
             score). Default False (portraits only, existing behavior unchanged).
 
-            tc_flag_r (float): Only used when with_timecourses=True. Cells with r below this are
-            titled in red and listed in a printed summary. Default 0.8.
+            tc_flag_r (float): Only used when with_timecourses=True. Cells with r below this get a
+            bold red title and a thick red frame around their timecourse panel, and are listed in a
+            printed summary. Default 0.8.
 
         Returns:
             dict of {cell_type: fig}, one figure per cell type plotted. Returns None if no cells
@@ -1170,24 +1171,31 @@ class AnalysisChunk:
                     if bad:
                         flagged[ct].append((cell_id, r))
 
-                    ax_t.fill_between(t_ms, tc_mean - tc_std, tc_mean + tc_std, color="tab:blue", alpha=0.25, lw=0)
-                    ax_t.plot(t_ms, tcs[cell_id], color="crimson" if bad else "k", lw=1.4, zorder=2)
-                    # mean drawn on top so it stays visible when the cell matches it closely
-                    ax_t.plot(t_ms, tc_mean, color="tab:blue", lw=1.0, zorder=3)
+                    # High-contrast pair: cell = red, type mean = blue (+/- SD shaded blue).
+                    # Mean drawn on top, thinner, so it stays visible when the two coincide.
+                    ax_t.fill_between(t_ms, tc_mean - tc_std, tc_mean + tc_std, color="#1f5fd6", alpha=0.18, lw=0)
+                    ax_t.plot(t_ms, tcs[cell_id], color="#e0201b", lw=1.6, zorder=2)
+                    ax_t.plot(t_ms, tc_mean, color="#1f5fd6", lw=1.1, zorder=3)
+                    if bad:
+                        # flagged: thick red frame + bold red title (the trace is always red now)
+                        for sp in ax_t.spines.values():
+                            sp.set_edgecolor("#e0201b")
+                            sp.set_linewidth(2.0)
                     ax_t.axhline(0, color="0.6", lw=0.5)
                     ax_t.set_ylim(-1.1, 1.1)
                     ax_t.set_xticks([])
                     ax_t.set_yticks([])
                     ax_p.set_title(
                         f"{cell_id}  r={r:.2f}", fontsize=8, loc="left",
-                        color="crimson" if bad else "k",
+                        color="#e0201b" if bad else "k",
+                        fontweight="bold" if bad else "normal",
                     )
                 for idx in range(n_cells, rows * cols):
                     r_i, c_i = divmod(idx, cols)
                     fig.delaxes(cast(Axes, axs[r_i, 2 * c_i]))
                     fig.delaxes(cast(Axes, axs[r_i, 2 * c_i + 1]))
                 fig.suptitle(
-                    f"{ct} RF portraits + timecourse (black) vs. type mean (blue) +/- SD (shaded), (n = {n_cells})",
+                    f"{ct} RF portraits + cell timecourse (red) vs. type mean (blue) +/- SD (shaded); red frame = r < {tc_flag_r}, (n = {n_cells})",
                     fontsize=13,
                 )
                 d_figs[ct] = fig

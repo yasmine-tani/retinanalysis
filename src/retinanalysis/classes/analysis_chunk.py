@@ -1368,8 +1368,16 @@ class AnalysisChunk:
 
                 # Robust (MAD-based) noise SD -- real RF signal is a small minority of
                 # pixels in the frame, so a plain std() would be inflated by it.
-                med = np.median(spat_map)
-                mad = np.median(np.abs(spat_map - med))
+                # Estimated on the real STA grid only: with padded=True, a cropped STA
+                # (staX/YChecks < numX/YChecks) is surrounded by zero padding, and on
+                # 20251016A that padding is 75% of the frame, which drove the MAD to 0 and
+                # made every cell's size NaN.
+                y0, x0 = int(self.deltaYChecks), int(self.deltaXChecks)
+                core = spat_map[y0 : y0 + int(self.staYChecks), x0 : x0 + int(self.staXChecks)]
+                if core.size == 0:
+                    core = spat_map
+                med = np.median(core)
+                mad = np.median(np.abs(core - med))
                 robust_sd = 1.4826 * mad
                 if robust_sd <= 0 or not np.isfinite(robust_sd):
                     rows.append({
@@ -1379,7 +1387,10 @@ class AnalysisChunk:
                     })
                     continue
 
-                significant = np.abs(spat_map - med) > (threshold_sd * robust_sd)
+                # Same sign as the peak only, so opposite-sign surround pixels touching the
+                # center can't be counted as part of it.
+                peak_sign = np.sign(spat_map[peak_y, peak_x] - med)
+                significant = peak_sign * (spat_map - med) > (threshold_sd * robust_sd)
                 labeled, _ = ndi_label(significant)
                 peak_label = labeled[peak_y, peak_x]
                 if peak_label == 0:

@@ -15,7 +15,9 @@ from pandas import DataFrame
 # from retinanalysis.utils.datajoint_utils import get_exp_summary
 from visionloader import load_vision_data
 
-from matplotlib.patches import Ellipse
+from matplotlib.patches import Ellipse, Polygon
+from matplotlib.path import Path as MplPath
+from skimage.measure import find_contours
 import xarray as xr
 from collections import Counter
 
@@ -569,6 +571,236 @@ def get_ells(
         d_ells_by_type[ct] = d_ells_by_id
 
     return d_ells_by_type, scale_factor
+
+
+AUTO_CONTOUR_LEVELS = np.round(np.arange(0.10, 0.91, 0.05), 2)
+AUTO_CONTOUR_FALLBACK = 0.5
+
+
+def _peak_normalized_map(sta: np.ndarray):
+    """Peak spatial frame of a (T, H, W, C) STA, divided by its signed peak value, so the RF
+    center is +1 at the peak for ON and OFF cells alike and the opposite-sign surround is
+    negative. Returns (map, (peak_row, peak_col)), or (None, None) if the STA is flat."""
+    peak_idx = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
+    t_idx, peak_y, peak_x, c_idx = peak_idx
+    spat_map = sta[t_idx, :, :, c_idx].astype(float)
+    peak_val = spat_map[peak_y, peak_x]
+    if peak_val == 0:
+        return None, None
+    return spat_map / peak_val, (peak_y, peak_x)
+
+
+def uniformity_index_curve(
+    d_maps: Dict[int, tuple], levels=AUTO_CONTOUR_LEVELS, upsample: int = 4
+) -> Optional[np.ndarray]:
+    """
+    Uniformity index (Gauthier et al. 2009, PLoS Biol, doi:10.1371/journal.pbio.1000063;
+    MATLAB calc_uniformity_index.m) of one cell type's mosaic at each contour level:
+    the fraction of the mosaic's interior covered by exactly one cell's RF. Too low a
+    level -> RFs pile on top of each other (overlap); too high -> holes between them
+    (gaps). A real mosaic tiles, so the level that maximizes UI is the one where the
+    contours tile best.
+
+    The interior (ROI) is the Delaunay triangulation of the cells' peak pixels, same as
+    the MATLAB version, so the empty space outside the mosaic's edge isn't counted as gaps.
+    Each cell's RF at a level = the connected region of its peak-normalized map >= level
+    that contains its peak pixel. Computed on the stixel grid upsampled `upsample`x
+    (bilinear) rather than by polygon clipping.
+
+    Parameters:
+        d_maps: {cell_id: (peak_normalized_map, (peak_row, peak_col))}, one entry per cell
+        of ONE type (see _peak_normalized_map).
+        levels: contour levels to evaluate.
+        upsample: upsampling factor for the coverage grid. Default 4.
+
+    Returns:
+        array of shape (len(levels), 3): columns = (UI, fraction of ROI with no RF,
+        fraction of ROI covered by 2+ RFs). None if there are fewer than 4 cells or the
+        peaks are collinear (no triangulation).
+    """
+    from scipy.ndimage import zoom, label
+    from scipy.spatial import Delaunay
+
+    if len(d_maps) < 4:
+        return None
+    up_maps, peaks = [], []
+    for m, (py, px) in d_maps.values():
+        up_maps.append(zoom(m, upsample, order=1))
+        peaks.append((py * upsample + upsample // 2, px * upsample + upsample // 2))
+    shape = up_maps[0].shape
+    peaks = np.array(peaks)
+    try:
+        tri = Delaunay(peaks)
+    except Exception:
+        return None
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+    roi = (tri.find_simplex(np.column_stack([yy.ravel(), xx.ravel()])) >= 0).reshape(shape)
+    if not roi.any():
+        return None
+
+    out = []
+    for lv in levels:
+        cov = np.zeros(shape, dtype=int)
+        for m, (py, px) in zip(up_maps, peaks):
+            lab, _ = label(m >= lv)
+            k = lab[min(py, shape[0] - 1), min(px, shape[1] - 1)]
+            if k > 0:
+                cov += lab == k
+        r = cov[roi]
+        out.append(((r == 1).mean(), (r == 0).mean(), (r >= 2).mean()))
+    return np.array(out)
+
+
+def get_rf_contours(
+    analysis_chunk: AnalysisChunk,
+    d_cells_by_type: Dict[str, List[int]],
+    contour_level: Union[float, str] = "auto",
+    units: str = "pixels",
+    typing_file: Optional[str] = None,
+    verbose: bool = True,
+) -> Tuple[Dict[str, dict], int]:
+    """
+    Non-parametric alternative to get_ells(): traces each cell's actual RF boundary
+    directly from its raw STA pixels via marching-squares contouring, the same approach
+    as the lab's MATLAB rf_contours.m / get_rf_contours.m, rather than drawing a fitted
+    Gaussian ellipse.
+
+    For each cell: take the STA frame containing that cell's own peak |deviation|, divide
+    it by the signed peak value (center -> +1 for ON and OFF cells alike; the opposite-sign
+    surround goes negative and is excluded, as in MATLAB rf_contours.m), and contour at the
+    level. Of the contour bands, keeps the smallest one enclosing the cell's own peak pixel.
+
+    Choosing the level: contour_level="auto" (default) picks, separately for each cell type,
+    the level in AUTO_CONTOUR_LEVELS (0.10-0.90) that maximizes that type's uniformity index
+    (see uniformity_index_curve; Gauthier et al. 2009, MATLAB calc_best_ui_thresh.m) -- i.e.
+    the level at which the type's contours tile space best, with the least overlap and the
+    fewest gaps. There's no single right fixed level: on 20251016A the best level ranged
+    0.40-0.65 across types, and at a fixed 0.25 the ON brisk sustained contours overlapped
+    over 99% of the mosaic. Types with fewer than 4 cells can't be scored and fall back to
+    AUTO_CONTOUR_FALLBACK (0.5). Pass a float to force one level for every type.
+
+    Parameters:
+        analysis_chunk (AnalysisChunk): the chunk to pull raw STAs from.
+
+        d_cells_by_type (Dict[str, List[int]]): cell ids to contour, grouped by type
+        (same shape as get_ells()'s d_cells_by_type).
+
+        contour_level (float or "auto"): see above. Default "auto".
+
+        units (str): 'pixels', 'microns', or 'stixels'. Default 'pixels'.
+
+        typing_file (str): typing file to pass through to get_stas(); if None, get_stas()
+        uses its own default (chunk's 0th typing file).
+
+        verbose (bool): print the level (and UI, when auto) used for each type. Default True.
+
+    Returns:
+        (d_contours_by_type, scale_factor): d_contours_by_type is
+        {cell_type: {cell_id: matplotlib.patches.Polygon}}, same dict shape as get_ells()'s
+        ellipses, so plot_rfs() can drop either dict into the same axes.add_patch() loop.
+        Drawn as outlines only (edgecolor f'C{idx}', no fill), so overlap between cells is
+        visible. scale_factor is the stixels-to-units conversion actually used (matches
+        get_ells()'s). The level/UI used per type is also stored on
+        analysis_chunk.last_contour_levels as {cell_type: (level, ui_or_None)}.
+    """
+    if "microns" in units.lower():
+        scale_factor = analysis_chunk.microns_per_stixel
+    elif "pixels" in units.lower():
+        scale_factor = analysis_chunk.pixels_per_stixel
+    elif "stixels" in units.lower():
+        scale_factor = 1
+    else:
+        raise NameError("Units string must be 'microns', 'pixels' or 'stixels'.")
+
+    auto = isinstance(contour_level, str)
+    if auto and contour_level.lower() != "auto":
+        raise ValueError("contour_level must be a float or 'auto'.")
+
+    all_ids = [cid for ids in d_cells_by_type.values() for cid in ids]
+    d_stas = analysis_chunk.get_stas(
+        noise_ids=all_ids,
+        cell_types=list(d_cells_by_type.keys()),
+        typing_file=typing_file,
+        padded=True,
+        units="stixels",
+    )
+    # get_stas() groups its output by cell_type -- flatten to a single cell_id lookup,
+    # since d_cells_by_type may group the same ids differently than get_stas() would on
+    # its own (e.g. when the caller passed noise_ids explicitly).
+    sta_by_id: Dict[int, np.ndarray] = {}
+    for ct_stas in d_stas.values():
+        sta_by_id.update(ct_stas)
+
+    d_contours_by_type = dict()
+    levels_used = dict()
+    for idx, ct in enumerate(d_cells_by_type.keys()):
+        d_maps = {}
+        for cell_id in d_cells_by_type[ct]:
+            sta = sta_by_id.get(cell_id)
+            if sta is None:
+                continue
+            m, pk = _peak_normalized_map(sta)
+            if m is not None:
+                d_maps[cell_id] = (m, pk)
+
+        ui = None
+        if auto:
+            curve = uniformity_index_curve(d_maps)
+            if curve is None:
+                level = AUTO_CONTOUR_FALLBACK
+            else:
+                best = int(np.argmax(curve[:, 0]))
+                level = float(AUTO_CONTOUR_LEVELS[best])
+                ui = float(curve[best, 0])
+        else:
+            level = float(contour_level)
+        levels_used[ct] = (level, ui)
+        if verbose:
+            if ui is not None:
+                print(f"{ct}: contour level {level:.2f} (uniformity index {ui:.2f})")
+            elif auto:
+                print(f"{ct}: contour level {level:.2f} (fewer than 4 cells, UI not computable -- fallback)")
+            else:
+                print(f"{ct}: contour level {level:.2f}")
+
+        d_contours_by_id = dict()
+        for cell_id, (norm_map, (peak_y, peak_x)) in d_maps.items():
+            contours = find_contours(norm_map, level=level)
+            if not contours:
+                continue
+
+            # Each contour is an array of (row, col) points. Keep only bands that
+            # actually enclose the cell's own peak pixel, then take the smallest-area
+            # one among those (the tightest boundary directly around the RF center).
+            best_xy = None
+            best_area = None
+            for c in contours:
+                path = MplPath(np.column_stack([c[:, 1], c[:, 0]]))  # (x, y) = (col, row)
+                if not path.contains_point((peak_x, peak_y)):
+                    continue
+                x, y = c[:, 1], c[:, 0]
+                area = 0.5 * abs(
+                    np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))
+                )
+                if best_area is None or area < best_area:
+                    best_area = area
+                    best_xy = np.column_stack([x, y])
+
+            if best_xy is None:
+                continue
+
+            d_contours_by_id[cell_id] = Polygon(
+                best_xy * scale_factor,
+                closed=True,
+                facecolor="none",
+                edgecolor=f"C{idx}",
+                linewidth=1.2,
+            )
+
+        d_contours_by_type[ct] = d_contours_by_id
+
+    analysis_chunk.last_contour_levels = levels_used
+    return d_contours_by_type, scale_factor
 
 
 def get_timecourses(

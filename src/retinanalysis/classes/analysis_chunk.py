@@ -4,7 +4,7 @@ import os
 from retinanalysis.config.settings import ANALYSIS_DIR, DATA_DIR
 from retinanalysis.utils.vision_utils import _resolve_vision_data_path
 import pandas as pd
-from retinanalysis.utils.vision_utils import get_analysis_vcd, get_ells, get_timecourses
+from retinanalysis.utils.vision_utils import get_analysis_vcd, get_ells, get_rf_contours, get_timecourses
 from hdf5storage import loadmat
 import pickle
 import numpy as np
@@ -12,8 +12,15 @@ from typing import cast, List, Dict, Optional, Any
 
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
+from matplotlib.colors import LinearSegmentedColormap
+
+# Diverging colormap for plot_rf_portraits(red_blue=True): negative -> blue, 0 -> white,
+# positive -> crimson (not matplotlib's stock 'RdBu_r', which is a duller brick-red/steel-blue).
+_CRIMSON_BLUE_CMAP = LinearSegmentedColormap.from_list(
+    "crimson_blue", ["blue", "white", "crimson"]
+)
 import visionloader as vl
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, label as ndi_label
 
 try:
     import importlib.resources as ir
@@ -627,6 +634,8 @@ class AnalysisChunk:
         typing_file: Optional[str] = None,
         units: str = "pixels",
         std_scaling: float = 1.6,
+        use_contours: bool = False,
+        contour_level: float | str = "auto",
         b_zoom: bool = False,
         n_pad: int = 6,
         minimum_n: int = 1,
@@ -640,6 +649,16 @@ class AnalysisChunk:
         or a union of both. If no cell_ids or cell types are given, all cells in the
         analysis chunk are plotted by type.
 
+        By default draws each cell's fitted Gaussian ellipse (SigmaX/SigmaY/Theta from the
+        .params file). Set use_contours=True to instead trace each cell's actual RF boundary
+        directly from its raw STA pixels (marching-squares contour, no fit involved) --
+        mirrors the lab's MATLAB rf_contours.m / get_rf_contours.m. The Gaussian fit is
+        convenient but not always accurate (it's produced real outliers and at least one
+        unit bug elsewhere in this repo), so use_contours is the more trustworthy option
+        when the exact RF shape/size matters, at the cost of being slower to compute (it
+        has to pull and threshold each cell's raw STA rather than just reading five fitted
+        numbers).
+
         Parameters:
             noise_ids (List[int]): A list of cell_ids to plot. Default None.
 
@@ -651,7 +670,17 @@ class AnalysisChunk:
             units (str): Units to use when plotting the receptive fields. Must be either 'pixels', 'microns',
             or 'stixels'. Default 'pixels'.
 
-            std_scaling (float): Factor used to scale the standard deviation of the plotted receptive fields. Default 1.6
+            std_scaling (float): Factor used to scale the standard deviation of the plotted receptive fields.
+            Default 1.6. Only used when use_contours=False (fitted ellipses).
+
+            use_contours (bool): If True, draw each cell's raw-STA contour boundary instead of its fitted
+            Gaussian ellipse. Default False (ellipses, existing behavior unchanged).
+
+            contour_level (float or "auto"): Only used when use_contours=True. Fraction of each cell's own
+            peak at which to draw its outline (lower = larger outline). Default "auto": for each cell type,
+            the level where that type's contours tile best (maximum uniformity index -- least overlap and
+            fewest gaps; printed per type). Pass a float to force one level for every type. See
+            get_rf_contours() for details.
 
             b_zoom (bool): Boolean value indicating whether or not to zoom the plots in on  the cell mosaic. Default False
 
@@ -769,11 +798,17 @@ class AnalysisChunk:
             )
             for ct in cell_types
         }
-        d_ells_by_type, scale_factor = get_ells(
-            self, d_noise_ids_by_type, std_scaling=std_scaling, units=units
-        )
+        if use_contours:
+            d_ells_by_type, scale_factor = get_rf_contours(
+                self, d_noise_ids_by_type, contour_level=contour_level,
+                units=units, typing_file=typing_file,
+            )
+        else:
+            d_ells_by_type, scale_factor = get_ells(
+                self, d_noise_ids_by_type, std_scaling=std_scaling, units=units
+            )
 
-        # Plot ellipses, one axis per cell type
+        # Plot ellipses/contours, one axis per cell type
         rows = int(np.ceil(len(cell_types) / 4))
         cols = np.min([(len(cell_types) - 1 % 4) + 1, 4])
         size = (4 * cols, int(3 * rows))
@@ -790,11 +825,20 @@ class AnalysisChunk:
         for idx, ct in enumerate(cell_types):
             ax = axs[idx]
             for id in d_ells_by_type[ct]:
-                ax.add_patch(d_ells_by_type[ct][id])
+                patch = d_ells_by_type[ct][id]
+                ax.add_patch(patch)
                 if label_cells:
+                    if hasattr(patch, "center"):
+                        # Ellipse
+                        label_x, label_y = patch.center
+                    else:
+                        # Polygon (use_contours=True) -- no .center, use the vertex
+                        # centroid instead.
+                        verts = patch.get_xy()
+                        label_x, label_y = verts[:, 0].mean(), verts[:, 1].mean()
                     ax.text(
-                        d_ells_by_type[ct][id].center[0],
-                        d_ells_by_type[ct][id].center[1],
+                        label_x,
+                        label_y,
                         str(id),
                         horizontalalignment="center",
                         verticalalignment="center",
@@ -854,19 +898,30 @@ class AnalysisChunk:
         typing_file: Optional[str] = None,
         plot_radius: int = 10,
         scale_up: int = 4,
-        cmap: str = "RdBu_r",
+        red_blue: bool = False,
+        cmap: Optional[str] = None,
         minimum_n: int = 1,
         n_cols: Optional[int] = None,
         exclude_unknown: bool = True,
+        with_timecourses: bool = False,
+        tc_flag_r: float = 0.8,
     ) -> Optional[Dict[str, Any]]:
         """
         Plot a grid of small per-cell receptive-field "portraits": each cell's own cropped,
-        polarity-corrected raw spatial STA pixels centered on that cell's RF, rather than the
-        fitted-ellipse mosaic that plot_rfs() draws. One figure is produced per cell type.
+        raw spatial STA pixels centered on that cell's RF, rather than the fitted-ellipse
+        mosaic that plot_rfs() draws. One figure is produced per cell type.
+
+        True ON/OFF polarity is preserved -- each portrait is scaled (not sign-flipped) so
+        an ON cell's positive-going center and an OFF cell's negative-going center stay on
+        opposite ends of the color scale, the same way they appear in the raw STA. Default
+        color scale is greyscale (black/white); pass red_blue=True for a crimson/blue diverging
+        scale instead. In both cases the scale is centered at 0 (mid-grey / white
+        respectively) with the endpoints set by each cell's own peak |deviation|, so color
+        is comparable across cells while polarity direction is not erased.
 
         Mirrors the lab's MATLAB plot_rf_portraits.m reference (crop raw RF pixels to a window
-        around each cell's own center, polarity-correct, normalize, tile into a grid). Built on
-        get_stas() (raw per-cell STAs read directly from the native .sta files via
+        around each cell's own center, normalize while preserving true polarity, tile into a
+        grid). Built on get_stas() (raw per-cell STAs read directly from the native .sta files via
         visionloader), the same source plot_stas() already uses -- NOT on d_spatial_maps /
         get_spatial_maps(), which depends on a separately-exported '<ss_version>_params.mat'
         file that most chunks don't actually have on disk (only a native Vision '.params' file).
@@ -887,8 +942,13 @@ class AnalysisChunk:
             scale_up (int): Integer factor to upscale each cropped portrait for display
             (nearest-neighbor), matching the MATLAB reference's matrix_scaled_up. Default 4.
 
-            cmap (str): Diverging colormap used to display polarity-corrected, normalized
-            pixels (so a cell's peak deviation is always +1, its opposite pole -1). Default 'RdBu_r'.
+            red_blue (bool): If False (default), display with a black/white greyscale
+            (positive deviation -> white, negative -> black, 0 -> mid-grey). If True, use a
+            crimson/blue diverging scale instead (positive -> crimson, negative -> blue,
+            0 -> white). True ON/OFF polarity is preserved either way -- see above.
+
+            cmap (str): Advanced override -- pass an explicit matplotlib colormap name to use
+            instead of the red_blue-selected default. Default None (use red_blue's choice).
 
             minimum_n (int): Minimum number of cells required for a cell type to be plotted.
 
@@ -897,6 +957,17 @@ class AnalysisChunk:
             exclude_unknown (bool): If True (default), drop the 'Unknown' cell type from the
             auto-detected type list when cell_types=None. Has no effect if cell_types is given
             explicitly.
+
+            with_timecourses (bool): If True, draw each cell's temporal RF (black) next to its
+            portrait, over the mean (blue line) +/- SD (blue shading) of all plotted cells of that type, so a cell whose timecourse
+            doesn't match its type (a likely classification mistake or a bad cell) stands out.
+            Each timecourse is normalized by its own peak |value| (sign kept, so ON/OFF polarity
+            still shows). The panel title gives r = correlation of the cell's timecourse with the
+            mean of the *other* cells of its type (leave-one-out, so a cell can't inflate its own
+            score). Default False (portraits only, existing behavior unchanged).
+
+            tc_flag_r (float): Only used when with_timecourses=True. Cells with r below this are
+            titled in red and listed in a printed summary. Default 0.8.
 
         Returns:
             dict of {cell_type: fig}, one figure per cell type plotted. Returns None if no cells
@@ -1011,12 +1082,12 @@ class AnalysisChunk:
                     src_y0:src_y1, src_x0:src_x1
                 ]
 
-            # Polarity-correct so the strongest deviation from zero is always positive,
-            # then normalize to [-1, 1] for a shared, comparable color scale across cells.
+            # Normalize to [-1, 1] by each cell's own peak |deviation| -- NOT sign-flipped,
+            # so an OFF cell's genuinely negative-going center stays negative (renders at the
+            # "black"/"blue" end) and an ON cell's positive-going center stays positive
+            # (renders at the "white"/"red" end). This is what preserves true ON/OFF polarity
+            # across cells, rather than normalizing every cell's peak to a common sign.
             if np.any(window):
-                peak = window.flat[np.argmax(np.abs(window))]
-                if peak < 0:
-                    window = -window
                 max_abs = np.max(np.abs(window))
                 if max_abs > 0:
                     window = window / max_abs
@@ -1026,7 +1097,33 @@ class AnalysisChunk:
 
             return window
 
+        # Default: black/white greyscale, positive->white, negative->black, 0->mid-grey.
+        # red_blue=True: crimson/blue diverging, positive->crimson, negative->blue, 0->white.
+        # An explicit cmap= always wins over red_blue.
+        resolved_cmap = cmap if cmap is not None else (_CRIMSON_BLUE_CMAP if red_blue else "gray")
+
+        def type_timecourses(ct_ids):
+            # Pick one color channel for the whole type: green if R/G/B are identical
+            # (monochrome rigs), otherwise whichever channel has the largest peak |value|.
+            chans = ["red", "green", "blue"]
+            first = self.d_timecourses[ct_ids[0]]
+            if np.array_equal(first["red"], first["green"]):
+                chan = "green"
+            else:
+                peaks = [
+                    np.mean([np.max(np.abs(self.d_timecourses[c][ch])) for c in ct_ids])
+                    for ch in chans
+                ]
+                chan = chans[int(np.argmax(peaks))]
+            tcs = {}
+            for c in ct_ids:
+                tc = np.asarray(self.d_timecourses[c][chan], dtype=float)
+                m = np.max(np.abs(tc))
+                tcs[c] = tc / m if m > 0 else tc
+            return tcs
+
         d_figs = {}
+        flagged = {}
         for ct in cell_types:
             ct_ids = list(d_stas.get(ct, {}).keys())
             if len(ct_ids) == 0:
@@ -1035,6 +1132,64 @@ class AnalysisChunk:
             n_cells = len(ct_ids)
             cols = n_cols or int(np.ceil(np.sqrt(n_cells)))
             rows = int(np.ceil(n_cells / cols))
+
+            if with_timecourses:
+                tcs = type_timecourses(ct_ids)
+                tc_stack = np.array([tcs[c] for c in ct_ids])
+                tc_mean = tc_stack.mean(axis=0)
+                tc_std = tc_stack.std(axis=0) if n_cells > 1 else np.zeros_like(tc_mean)
+                # Same time axis convention as plot_timecourses() (ms before the spike).
+                t_ms = np.linspace(-491.66, 8.33, len(tc_mean))
+
+                fig, axs = plt.subplots(
+                    nrows=rows,
+                    ncols=2 * cols,
+                    figsize=(1.6 * cols + 2.2 * cols, 1.6 * rows),
+                    layout="constrained",
+                    gridspec_kw={"width_ratios": [1, 1.4] * cols},
+                )
+                axs = np.array(axs).reshape(rows, 2 * cols)
+                flagged[ct] = []
+                for idx, cell_id in enumerate(ct_ids):
+                    r_i, c_i = divmod(idx, cols)
+                    ax_p, ax_t = axs[r_i, 2 * c_i], axs[r_i, 2 * c_i + 1]
+                    portrait = crop_portrait(cell_id, d_stas[ct][cell_id])
+                    ax_p.imshow(portrait, cmap=resolved_cmap, vmin=-1, vmax=1, interpolation="nearest")
+                    ax_p.set_xticks([])
+                    ax_p.set_yticks([])
+
+                    others = [tcs[c] for c in ct_ids if c != cell_id]
+                    loo_mean = np.mean(others, axis=0) if others else tc_mean
+                    if np.std(tcs[cell_id]) > 0 and np.std(loo_mean) > 0:
+                        r = float(np.corrcoef(tcs[cell_id], loo_mean)[0, 1])
+                    else:
+                        r = np.nan
+                    bad = np.isfinite(r) and r < tc_flag_r
+                    if bad:
+                        flagged[ct].append((cell_id, r))
+
+                    ax_t.fill_between(t_ms, tc_mean - tc_std, tc_mean + tc_std, color="tab:blue", alpha=0.25, lw=0)
+                    ax_t.plot(t_ms, tcs[cell_id], color="crimson" if bad else "k", lw=1.4, zorder=2)
+                    # mean drawn on top so it stays visible when the cell matches it closely
+                    ax_t.plot(t_ms, tc_mean, color="tab:blue", lw=1.0, zorder=3)
+                    ax_t.axhline(0, color="0.6", lw=0.5)
+                    ax_t.set_ylim(-1.1, 1.1)
+                    ax_t.set_xticks([])
+                    ax_t.set_yticks([])
+                    ax_p.set_title(
+                        f"{cell_id}  r={r:.2f}", fontsize=8, loc="left",
+                        color="crimson" if bad else "k",
+                    )
+                for idx in range(n_cells, rows * cols):
+                    r_i, c_i = divmod(idx, cols)
+                    fig.delaxes(cast(Axes, axs[r_i, 2 * c_i]))
+                    fig.delaxes(cast(Axes, axs[r_i, 2 * c_i + 1]))
+                fig.suptitle(
+                    f"{ct} RF portraits + timecourse (black) vs. type mean (blue) +/- SD (shaded), (n = {n_cells})",
+                    fontsize=13,
+                )
+                d_figs[ct] = fig
+                continue
 
             fig, axs = plt.subplots(
                 nrows=rows,
@@ -1052,7 +1207,7 @@ class AnalysisChunk:
                 # imshow interpolation ('antialiased', which blurs/smooths neighboring
                 # pixels together) was defeating that and making everything look
                 # over-smoothed. Nearest gives crisp per-stixel blocks instead.
-                ax.imshow(portrait, cmap=cmap, vmin=-1, vmax=1, interpolation="nearest")
+                ax.imshow(portrait, cmap=resolved_cmap, vmin=-1, vmax=1, interpolation="nearest")
                 ax.set_title(str(cell_id), fontsize=8)
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -1064,7 +1219,178 @@ class AnalysisChunk:
             fig.suptitle(f"{ct} RF portraits, (n = {n_cells})", fontsize=13)
             d_figs[ct] = fig
 
+        if with_timecourses:
+            for ct, cells in flagged.items():
+                if cells:
+                    listing = ", ".join(f"{c} (r={r:.2f})" for c, r in cells)
+                    print(f"{ct}: {len(cells)} cell(s) with timecourse r < {tc_flag_r}: {listing}")
+                else:
+                    print(f"{ct}: no cells with timecourse r < {tc_flag_r}")
+
         return d_figs
+
+    def get_rf_sizes_from_sta(
+        self,
+        noise_ids: Optional[List[int]] = None,
+        cell_types: Optional[List[str]] = None,
+        typing_file: Optional[str] = None,
+        threshold_sd: float = 5.0,
+        minimum_n: int = 1,
+        exclude_unknown: bool = True,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Measure each cell's receptive-field size directly from its raw STA pixels --
+        deliberately NOT from the Gaussian/DoG fit (SigmaX/SigmaY in the .params file).
+        That fit is convenient but not reliably accurate (see e.g. the RF-portrait
+        polarity work and the contrast-response fit auditing elsewhere in this repo --
+        fitted parameters can be subtly wrong or produce implausible outliers). This
+        instead finds the set of "significant" stixels around each cell's own peak STA
+        deviation using a robust noise threshold, the same spirit as the lab's MATLAB
+        significant_stixels.m / get_sta_summaries.m, and reports the physical area/
+        diameter of that measured footprint.
+
+        Method, per cell:
+            1. Take the single time/color frame containing the cell's peak |STA deviation|
+               (same convention plot_rf_portraits() uses).
+            2. Estimate the noise floor with a robust (MAD-based) standard deviation of
+               that whole frame -- robust because real RF signal is a small minority of
+               pixels and would otherwise inflate a plain stdev.
+            3. Threshold at threshold_sd x that robust noise std.
+            4. Keep only the connected component of thresholded pixels touching the
+               cell's own peak pixel, so an unrelated noisy stixel elsewhere in the frame
+               (or another cell's RF bleeding into a shared crop) isn't counted.
+            5. RF area = (# pixels in that component) x microns_per_stixel^2.
+               RF diameter = the diameter of a circle with that same area
+               (2 x sqrt(area / pi)) -- reported as an "equivalent diameter" since a real
+               significant-stixel footprint is rarely a perfect circle or ellipse.
+
+        Parameters:
+            noise_ids, cell_types, typing_file, minimum_n, exclude_unknown: same meaning
+            as plot_rf_portraits().
+
+            threshold_sd (float): number of robust noise SDs a stixel's |deviation| must
+            exceed to count as part of the RF. Default 5.0 (a conventional, conservative
+            threshold in this field -- lower values include more low-confidence pixels).
+
+        Returns:
+            pd.DataFrame with one row per cell: cell_id, cell_type, n_significant_stixels,
+            rf_area_um2, rf_diameter_um. Returns None if no cells match the given filters.
+        """
+        if typing_file is None:
+            try:
+                typing_file = self.typing_files[0]
+            except Exception:
+                print(f"No typing files for {self.exp_name} {self.chunk_name}")
+                return None
+
+        if typing_file not in self.typing_files:
+            print(f"{typing_file} Doesn't Exist in {self.exp_name} {self.chunk_name}")
+            return None
+
+        typing_file_idx = self.typing_files.index(typing_file)
+        cell_types_was_none = cell_types is None
+        if isinstance(cell_types, str):
+            cell_types = [cell_types]
+        if isinstance(noise_ids, int) or isinstance(noise_ids, float):
+            noise_ids = [int(noise_ids)]
+
+        if noise_ids is None and cell_types is None:
+            filtered_df = self.df_cell_params
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        elif noise_ids is None:
+            filtered_df = self.df_cell_params.query(
+                f"typing_file_{typing_file_idx} in @cell_types"
+            )
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        elif cell_types is None:
+            filtered_df = self.df_cell_params.query("cell_id in @noise_ids")
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+        else:
+            filtered_df = self.df_cell_params.query(
+                f"typing_file_{typing_file_idx} in @cell_types and cell_id in @noise_ids"
+            )
+            cell_types = sorted(filtered_df[f"typing_file_{typing_file_idx}"].unique())
+
+        if exclude_unknown and cell_types_was_none:
+            cell_types = [ct for ct in cell_types if str(ct).strip().lower() != "unknown"]
+
+        if len(filtered_df) == 0:
+            print("No data found for the given noise_ids and cell_types.")
+            return None
+
+        too_few_cells = [
+            ct
+            for ct in cell_types
+            if len(
+                filtered_df.query(f"typing_file_{typing_file_idx} == @ct")["cell_id"].values
+            )
+            < minimum_n
+        ]
+        for ct in too_few_cells:
+            cell_types.remove(ct)
+        cell_types = sorted(cell_types)
+
+        if len(cell_types) == 0:
+            print("No cell types met minimum_n after filtering.")
+            return None
+
+        plot_ids = list(
+            filtered_df.query(f"typing_file_{typing_file_idx} in @cell_types")[
+                "cell_id"
+            ].values
+        )
+        d_stas = self.get_stas(
+            noise_ids=plot_ids,
+            cell_types=cell_types,
+            typing_file=typing_file,
+            padded=True,
+            units="stixels",
+        )
+
+        um2_per_stixel = self.microns_per_stixel ** 2
+        rows = []
+        for ct in cell_types:
+            for cell_id, sta in d_stas.get(ct, {}).items():
+                peak_idx = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
+                t_idx, c_idx = peak_idx[0], peak_idx[3]
+                spat_map = sta[t_idx, :, :, c_idx]
+                peak_y, peak_x = peak_idx[1], peak_idx[2]
+
+                # Robust (MAD-based) noise SD -- real RF signal is a small minority of
+                # pixels in the frame, so a plain std() would be inflated by it.
+                med = np.median(spat_map)
+                mad = np.median(np.abs(spat_map - med))
+                robust_sd = 1.4826 * mad
+                if robust_sd <= 0 or not np.isfinite(robust_sd):
+                    rows.append({
+                        "cell_id": cell_id, "cell_type": ct,
+                        "n_significant_stixels": 0, "rf_area_um2": np.nan,
+                        "rf_diameter_um": np.nan,
+                    })
+                    continue
+
+                significant = np.abs(spat_map - med) > (threshold_sd * robust_sd)
+                labeled, _ = ndi_label(significant)
+                peak_label = labeled[peak_y, peak_x]
+                if peak_label == 0:
+                    # Peak pixel itself didn't clear threshold (shouldn't normally happen
+                    # since it's the largest deviation in the frame) -- fall back to just
+                    # that single pixel rather than reporting a spurious zero.
+                    n_stixels = 1
+                else:
+                    n_stixels = int(np.sum(labeled == peak_label))
+
+                area_um2 = n_stixels * um2_per_stixel
+                diameter_um = 2.0 * np.sqrt(area_um2 / np.pi)
+                rows.append({
+                    "cell_id": cell_id, "cell_type": ct,
+                    "n_significant_stixels": n_stixels, "rf_area_um2": area_um2,
+                    "rf_diameter_um": diameter_um,
+                })
+
+        if not rows:
+            return None
+        return pd.DataFrame(rows)
 
     def plot_timecourses(
         self,

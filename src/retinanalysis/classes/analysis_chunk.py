@@ -958,8 +958,8 @@ class AnalysisChunk:
             auto-detected type list when cell_types=None. Has no effect if cell_types is given
             explicitly.
 
-            with_timecourses (bool): If True, draw each cell's temporal RF (black) next to its
-            portrait, over the mean (blue line) +/- SD (blue shading) of all plotted cells of that type, so a cell whose timecourse
+            with_timecourses (bool): If True, draw each cell's temporal RF (black; computed from
+            its STA center pixels, not the .params timecourse fields) next to its portrait, over the mean (blue line) +/- SD (blue shading) of all plotted cells of that type, so a cell whose timecourse
             doesn't match its type (a likely classification mistake or a bad cell) stands out.
             Each timecourse is normalized by its own peak |value| (sign kept, so ON/OFF polarity
             still shows). The panel title gives r = correlation of the cell's timecourse with the
@@ -1102,38 +1102,26 @@ class AnalysisChunk:
         # An explicit cmap= always wins over red_blue.
         resolved_cmap = cmap if cmap is not None else (_CRIMSON_BLUE_CMAP if red_blue else "gray")
 
-        def type_timecourses(ct_ids):
-            # Pick one color channel for the whole type: green if R/G/B are identical
-            # (monochrome rigs), otherwise whichever channel has the largest peak |value|.
-            chans = ["red", "green", "blue"]
-            first = self.d_timecourses[ct_ids[0]]
-            if np.array_equal(first["red"], first["green"]):
-                chan = "green"
-            else:
-                peaks = [
-                    np.mean([np.max(np.abs(self.d_timecourses[c][ch])) for c in ct_ids])
-                    for ch in chans
-                ]
-                chan = chans[int(np.argmax(peaks))]
+        def type_timecourses(ct_stas):
+            # Each cell's temporal RF, computed from its own STA (the same STA the portrait
+            # shows): mean over time of the center pixels, i.e. the connected region of the
+            # peak frame >= 50% of the signed peak. Deliberately NOT the .params
+            # Red/Green/BlueTimeCourse fields, which come back as ~1e-312 garbage on builds
+            # with the visionloader double-array bug unless ra.patch_vision_double_array_bug()
+            # was called (changes/vcext_double_array_bug_2026-08-19.md). Checked on 20251016A:
+            # matches the (correctly parsed) .params GreenTimeCourse at r = 0.995 median
+            # (min 0.985, n = 63), same frame order.
+            from scipy.ndimage import label as _label
+
             tcs = {}
-            raw_peak = 0.0
-            for c in ct_ids:
-                tc = np.asarray(self.d_timecourses[c][chan], dtype=float)
+            for c, sta in ct_stas.items():
+                pk = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
+                frame = sta[pk[0], :, :, pk[3]]
+                lab, _ = _label(frame / frame[pk[1], pk[2]] >= 0.5)
+                mask = lab == lab[pk[1], pk[2]]
+                tc = sta[:, :, :, pk[3]][:, mask].mean(axis=1).astype(float)
                 m = np.max(np.abs(tc))
-                raw_peak = max(raw_peak, m)
                 tcs[c] = tc / m if m > 0 else tc
-            if raw_peak < 1e-100:
-                # All-zero or denormalized (~1e-312) values = the visionloader double-array
-                # parsing bug (changes/vcext_double_array_bug_2026-08-19.md), not real data.
-                print(
-                    f"WARNING: timecourses for this chunk are all ~0 (max |value| {raw_peak:.3g}), "
-                    "so the timecourse panels will look blank. This is the visionloader "
-                    "double-array bug: call ra.patch_vision_double_array_bug() right after "
-                    "import, then rebuild the pipeline."
-                )
-                # Draw flat zeros instead of normalized garbage, and skip r/flagging
-                # (every cell would otherwise be falsely flagged).
-                tcs = {c: np.zeros_like(tc) for c, tc in tcs.items()}
             return tcs
 
         d_figs = {}
@@ -1148,7 +1136,7 @@ class AnalysisChunk:
             rows = int(np.ceil(n_cells / cols))
 
             if with_timecourses:
-                tcs = type_timecourses(ct_ids)
+                tcs = type_timecourses(d_stas[ct])
                 tc_stack = np.array([tcs[c] for c in ct_ids])
                 tc_mean = tc_stack.mean(axis=0)
                 tc_std = tc_stack.std(axis=0) if n_cells > 1 else np.zeros_like(tc_mean)

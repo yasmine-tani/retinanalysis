@@ -190,3 +190,92 @@ def export_figure_data(fig=None, path: str = "figure_data") -> Optional[str]:
     df.to_csv(out, index=False)
     print(f"Saved {os.path.basename(out)} ({df.shape[1]} columns)")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Notebook-wide switch: save figures from chosen cells automatically.
+# ---------------------------------------------------------------------------
+_AUTO_SAVE = {"cells": None, "folder": "figures", "formats": ("svg", "pdf"), "dpi": 300,
+              "current_cell": None, "figs_before": set(), "registered": False}
+
+
+def _slug(text: str, n: int = 40) -> str:
+    keep = "".join(ch if ch.isalnum() else "-" for ch in text.strip())
+    while "--" in keep:
+        keep = keep.replace("--", "-")
+    return keep.strip("-")[:n]
+
+
+def _auto_save_pre(info=None):
+    import IPython
+    ip = IPython.get_ipython()
+    _AUTO_SAVE["current_cell"] = ip.execution_count if ip is not None else None
+    # figures already open before this cell ran (non-inline backends keep them open)
+    _AUTO_SAVE["figs_before"] = set(plt.get_fignums())
+
+
+def _auto_save_post():
+    cells = _AUTO_SAVE["cells"]
+    n = _AUTO_SAVE["current_cell"]
+    if cells is None or n is None:
+        return
+    if cells != "all" and n not in cells:
+        return
+    new_figs = [num for num in plt.get_fignums() if num not in _AUTO_SAVE["figs_before"]]
+    for k, num in enumerate(new_figs, start=1):
+        fig = plt.figure(num)
+        title = fig._suptitle.get_text() if getattr(fig, "_suptitle", None) is not None else ""
+        if not title and fig.axes:
+            title = fig.axes[0].get_title()
+        name = f"cell{n:02d}_{k}" + (f"_{_slug(title)}" if title else "")
+        save_figure(fig, os.path.join(_AUTO_SAVE["folder"], name),
+                    formats=_AUTO_SAVE["formats"], dpi=_AUTO_SAVE["dpi"])
+
+
+def auto_save_figures(cells="all", folder: str = "figures", formats=("svg", "pdf"), dpi: int = 300):
+    """
+    Turn on automatic saving for a notebook: every figure made in the chosen cells is saved
+    with save_figure() (editable-text SVG + PDF by default) as soon as the cell finishes.
+    Only figures created in that cell are saved, not ones left open from earlier cells.
+
+    Put this in one cell near the top:
+
+        ra.auto_save_figures('all')          # every cell
+        ra.auto_save_figures([12, 15])       # only cells [12] and [15]
+        ra.auto_save_figures(None)           # off
+
+    Parameters:
+        cells: 'all', a list of cell numbers, or None/False to turn saving off. Cell numbers
+            are the [n] Jupyter shows to the left of a cell after it runs. They change when
+            you re-run cells, so use them after Kernel -> Restart & Run All, when they count
+            1, 2, 3, ... from the top.
+        folder (str): where files go (created if needed). Default 'figures'.
+        formats: file types to write. Default ('svg', 'pdf'); add 'png' for a preview.
+        dpi (int): resolution for PNGs and for flattened dense parts. Default 300.
+
+    Files are named cell<n>_<k>_<figure title>, e.g. cell12_1_off-brisk-sustained-RF-portraits.svg.
+    Only works inside Jupyter/IPython.
+    """
+    import IPython
+    ip = IPython.get_ipython()
+    if ip is None:
+        print("auto_save_figures only works inside a Jupyter notebook.")
+        return
+    if cells is False:
+        cells = None
+    if cells is not None and cells != "all":
+        cells = {int(c) for c in cells}
+    _AUTO_SAVE.update(cells=cells, folder=folder, formats=tuple(formats), dpi=dpi)
+
+    if not _AUTO_SAVE["registered"]:
+        ip.events.register("pre_run_cell", _auto_save_pre)
+        # Must run BEFORE the inline backend closes the cell's figures, which also happens
+        # on 'post_execute' -- so put this callback first in that list.
+        ip.events.callbacks["post_execute"].insert(0, _auto_save_post)
+        _AUTO_SAVE["registered"] = True
+
+    if cells is None:
+        print("Automatic figure saving is OFF.")
+    else:
+        which = "every cell" if cells == "all" else "cells " + ", ".join(str(c) for c in sorted(cells))
+        print(f"Automatic figure saving is ON for {which} -> {os.path.abspath(folder)} ({', '.join(formats)})")

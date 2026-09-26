@@ -71,7 +71,7 @@ from .utils import parse_data
 # Saving figures as editable vector graphics (save_figure) and exporting the numbers
 # behind a plot as CSV (export_figure_data).
 from .utils import export_utils
-from .utils.export_utils import save_figure, export_figure_data, figure_data_to_frame
+from .utils.export_utils import save_figure, export_figure_data, figure_data_to_frame, auto_save_figures
 
 # Import preprocessing
 from . import preprocessing

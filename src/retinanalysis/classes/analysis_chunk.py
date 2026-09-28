@@ -30,6 +30,24 @@ except:
 from retinanalysis.utils.datajoint_utils import get_noise_name_by_exp
 
 
+
+# Classification files with these initials (e.g. "data018.classificationYT.txt") are the
+# default typing file for every AnalysisChunk. Change here to prefer someone else's labels.
+PREFERRED_TYPING_INITIALS = "YT"
+
+
+def _prefer_initials(typing_files, initials):
+    """Return typing_files with the first classification file whose name contains
+    `initials` (case-sensitive, e.g. 'classificationYT') moved to the front; other files
+    keep their original order. Unchanged if no such file exists."""
+    if not initials:
+        return list(typing_files)
+    pick = next((f for f in typing_files if "classification" in f.lower() and initials in f), None)
+    if pick is None:
+        return list(typing_files)
+    return [pick] + [f for f in typing_files if f != pick]
+
+
 class AnalysisChunk:
     """
     Class that contains data from an MEA sorting chunk created primarily from spatial noise.
@@ -344,7 +362,14 @@ class AnalysisChunk:
                 seen_files.add(file)
                 typing_files.append(file)
 
-        self.typing_files = typing_files
+        # CHANGED 2026-09-27 (Claude, per yas): the default typing file is typing_files[0]
+        # everywhere (MEAPipeline, Response, vision_utils, the plot functions), and that
+        # used to be whatever os.listdir() returned first -- e.g. data018.classificationag.txt
+        # ahead of data018.classificationYT.txt. Now a classification file carrying the
+        # PREFERRED_TYPING_INITIALS is moved to the front; if there isn't one, the order is
+        # unchanged, so the first file present is still the default. Passing typing_file /
+        # typing_file_name explicitly still picks any file.
+        self.typing_files = _prefer_initials(typing_files, PREFERRED_TYPING_INITIALS)
 
         # typing_files = schema.CellTypeFile() & {'chunk_id' : self.chunk_id, 'algorithm': self.ss_version}
         # self.typing_files = [file_name for file_name in typing_files.fetch('file_name')]

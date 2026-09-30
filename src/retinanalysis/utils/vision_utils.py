@@ -591,6 +591,27 @@ def _peak_normalized_map(sta: np.ndarray):
     return spat_map / peak_val, (peak_y, peak_x)
 
 
+def _smoothed_peak_map(sta: np.ndarray, sigma: float = 0.7):
+    """Like _peak_normalized_map, but less noisy, for contouring: averages the peak frame
+    with the frames just before and after it, blurs lightly (Gaussian, `sigma` stixels),
+    then divides by the signed peak of that smoothed map. Returns (map, (peak_row,
+    peak_col)) on the stixel grid, or (None, None) if the STA is flat.
+
+    ADDED 2026-09-30 (Claude, per yas -- contours "look so bad"): tracing the single raw
+    peak frame at stixel resolution turns every noisy edge stixel into a dent or spike,
+    because these RFs are only ~6-8 stixels across."""
+    from scipy.ndimage import gaussian_filter
+    t_idx, _, _, c_idx = np.unravel_index(np.argmax(np.abs(sta)), sta.shape)
+    frame = sta[max(t_idx - 1, 0): t_idx + 2, :, :, c_idx].astype(float).mean(axis=0)
+    if sigma and sigma > 0:
+        frame = gaussian_filter(frame, sigma)
+    peak_y, peak_x = np.unravel_index(np.argmax(np.abs(frame)), frame.shape)
+    peak_val = frame[peak_y, peak_x]
+    if peak_val == 0:
+        return None, None
+    return frame / peak_val, (peak_y, peak_x)
+
+
 def uniformity_index_curve(
     d_maps: Dict[int, tuple], levels=AUTO_CONTOUR_LEVELS, upsample: int = 4
 ) -> Optional[np.ndarray]:
@@ -659,6 +680,9 @@ def get_rf_contours(
     units: str = "pixels",
     typing_file: Optional[str] = None,
     verbose: bool = True,
+    smooth: bool = True,
+    smooth_sigma: float = 0.7,
+    upsample: int = 4,
 ) -> Tuple[Dict[str, dict], int]:
     """
     Non-parametric alternative to get_ells(): traces each cell's actual RF boundary
@@ -694,6 +718,16 @@ def get_rf_contours(
         uses its own default (chunk's 0th typing file).
 
         verbose (bool): print the level (and UI, when auto) used for each type. Default True.
+
+        smooth (bool): ADDED 2026-09-30. Default True: contour a smoothed map (peak frame
+        averaged with its neighbouring frames, Gaussian blur of `smooth_sigma` stixels; see
+        _smoothed_peak_map), traced on a cubic `upsample`x-interpolated grid, so outlines
+        are smooth curves instead of stixel staircases. False = the old behaviour (raw
+        peak frame, stixel grid). The auto level is scored on whichever map is contoured.
+
+        smooth_sigma (float): blur width in stixels when smooth=True. Default 0.7.
+
+        upsample (int): interpolation factor for tracing when smooth=True. Default 4.
 
     Returns:
         (d_contours_by_type, scale_factor): d_contours_by_type is
@@ -740,7 +774,7 @@ def get_rf_contours(
             sta = sta_by_id.get(cell_id)
             if sta is None:
                 continue
-            m, pk = _peak_normalized_map(sta)
+            m, pk = _smoothed_peak_map(sta, smooth_sigma) if smooth else _peak_normalized_map(sta)
             if m is not None:
                 d_maps[cell_id] = (m, pk)
 
@@ -766,7 +800,18 @@ def get_rf_contours(
 
         d_contours_by_id = dict()
         for cell_id, (norm_map, (peak_y, peak_x)) in d_maps.items():
-            contours = find_contours(norm_map, level=level)
+            if smooth and upsample > 1:
+                # Trace on a cubic-interpolated grid, then map points back to stixel
+                # coordinates. scipy's zoom (grid_mode=False) puts output index o at input
+                # coordinate o * (n - 1) / (n_up - 1) along each axis.
+                from scipy.ndimage import zoom as _zoom
+                fine = _zoom(norm_map, upsample, order=3)
+                ry = (norm_map.shape[0] - 1) / (fine.shape[0] - 1)
+                rx = (norm_map.shape[1] - 1) / (fine.shape[1] - 1)
+                contours = [np.column_stack([c[:, 0] * ry, c[:, 1] * rx])
+                            for c in find_contours(fine, level=level)]
+            else:
+                contours = find_contours(norm_map, level=level)
             if not contours:
                 continue
 

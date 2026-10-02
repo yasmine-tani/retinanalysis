@@ -151,7 +151,24 @@ def scrollable_figure(fig, max_height_px=600, dpi=100):
     ))
 
 
-def scrollable_dataframe(df, max_height_px=400):
+# Internal DataJoint keys (row numbers used to join tables). They mean nothing to a reader
+# and change on reload, so tables shown to the user leave them out (per yas, 2026-10-02).
+DB_ID_COLUMNS = ('experiment_id', 'protocol_id', 'group_id', 'block_id', 'chunk_id', 'epoch_id',
+                 'prep_id', 'animal_id', 'parent_id', 'id', 'level_0', 'index')
+
+
+def hide_db_ids(df):
+    """Copy of df without DataJoint's internal ID columns (DB_ID_COLUMNS). 'cell_id' is
+    dropped only in database summary tables (those that also have group_id/block_id), where
+    it is Symphony's tissue-level "Cell" key; in response tables cell_id is the sorted
+    neuron ID and is kept."""
+    drop = [c for c in df.columns if c in DB_ID_COLUMNS]
+    if 'cell_id' in df.columns and ({'group_id', 'block_id'} & set(df.columns)):
+        drop.append('cell_id')
+    return df.drop(columns=drop)
+
+
+def scrollable_dataframe(df, max_height_px=400, show_ids=False):
     """
     NEW 2026-08-12 (Claude, per yas): displays a pandas DataFrame inside a fixed-height,
     scrollable HTML box -- the dataframe equivalent of scrollable_figure()/
@@ -177,11 +194,16 @@ def scrollable_dataframe(df, max_height_px=400):
         (a bit taller than scrollable_prints()'s 220 default, since a wide dataframe
         with column headers needs more room to be readable at all).
 
+        show_ids (bool): default False hides DataJoint's internal ID columns (see
+        hide_db_ids). Display only -- df itself is unchanged.
+
     Returns:
         None -- displays directly, like IPython.display.display().
     """
     from IPython.display import display, HTML
 
+    if not show_ids:
+        df = hide_db_ids(df)
     display(HTML(
         '<div style="max-height:{h}px; overflow-y:auto; border:1px solid #ddd; '
         'margin-bottom:4px;">{t}</div>'.format(h=max_height_px, t=df.to_html())
